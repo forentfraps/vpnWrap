@@ -47,6 +47,8 @@ func main() {
 	keyPath := flag.String("key", "/etc/sing-rdp/key.pem", "TLS key path")
 	healthAddr := flag.String("health", "127.0.0.1:9180", "health endpoint listen address (empty to disable)")
 	hbInterval := flag.Duration("heartbeat", 5*time.Second, "Fast-Path heartbeat interval")
+	logConns := flag.Bool("log-connections", true, "log every connection (src ip + classification + duration)")
+	logProbeNoise := flag.Bool("log-loopback-probes", false, "include 127.0.0.1 health-loopback probes in conn log (noisy)")
 	flag.Parse()
 
 	if *cookie == "" {
@@ -69,11 +71,13 @@ func main() {
 	log.Printf("sing-rdp-server listening on %s (upstream=%s xrdp=%s)", *listen, *upstream, *xrdpAddr)
 
 	srv := &server{
-		tlsCfg:    tlsCfg,
-		upstream:  *upstream,
-		xrdpAddr:  *xrdpAddr,
-		cookie:    *cookie,
-		heartbeat: *hbInterval,
+		tlsCfg:        tlsCfg,
+		upstream:      *upstream,
+		xrdpAddr:      *xrdpAddr,
+		cookie:        *cookie,
+		heartbeat:     *hbInterval,
+		logConns:      *logConns,
+		logProbeNoise: *logProbeNoise,
 		identity: credssp.MachineIdentity{
 			NetBIOSName:   *hostname,
 			DNSName:       *hostname,
@@ -115,14 +119,47 @@ func main() {
 }
 
 type server struct {
-	tlsCfg    *tls.Config
-	upstream  string
-	xrdpAddr  string
-	cookie    string
-	heartbeat time.Duration
-	identity  credssp.MachineIdentity
+	tlsCfg        *tls.Config
+	upstream      string
+	xrdpAddr      string
+	cookie        string
+	heartbeat     time.Duration
+	identity      credssp.MachineIdentity
+	logConns      bool
+	logProbeNoise bool
 
 	active sync.WaitGroup
+}
+
+// srcLabel formats a connection's source address for log lines. Strip the
+// port — it's not useful for observability (changes per-connection) and
+// only clutters output.
+func srcLabel(c net.Conn) string {
+	if a := c.RemoteAddr(); a != nil {
+		host, _, err := net.SplitHostPort(a.String())
+		if err == nil {
+			return host
+		}
+		return a.String()
+	}
+	return "?"
+}
+
+// isLoopback returns true if the remote of c is 127.0.0.1 / ::1. The
+// in-process /healthz probe goes through the public listener (same path
+// real clients take, to catch regressions); without this filter every
+// readiness check spams the log every 30s.
+func isLoopback(c net.Conn) bool {
+	a := c.RemoteAddr()
+	if a == nil {
+		return false
+	}
+	host, _, err := net.SplitHostPort(a.String())
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (s *server) handle(raw net.Conn) {
@@ -130,14 +167,31 @@ func (s *server) handle(raw net.Conn) {
 	defer s.active.Done()
 	defer raw.Close()
 
+	src := srcLabel(raw)
+	suppressLog := !s.logConns || (isLoopback(raw) && !s.logProbeNoise)
+	logf := func(format string, args ...any) {
+		if !suppressLog {
+			log.Printf(format, args...)
+		}
+	}
+	startedAt := time.Now()
+
 	_ = raw.SetDeadline(time.Now().Add(30 * time.Second))
 
 	cr, replay, err := rdp.PeekConnectionRequest(raw)
 	if err != nil || !cr.MatchesCookie(s.cookie) {
-		// Not a tunnel client — relay to xrdp.
+		// Not a tunnel client — relay to xrdp. Useful signal: tells you
+		// which IPs are probing your server with unexpected/missing cookies.
+		reason := "wrong-cookie"
+		if err != nil {
+			reason = "bad-CR"
+		}
+		logf("conn from %s: probe (%s) -> spliced to xrdp", src, reason)
 		spliceToXrdp(raw, s.xrdpAddr, replay)
 		return
 	}
+
+	logf("conn from %s: tunnel handshake start", src)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -150,7 +204,8 @@ func (s *server) handle(raw net.Conn) {
 		Timeout:       30 * time.Second,
 	})
 	if err != nil {
-		log.Printf("handshake failed (post-cookie): %v", err)
+		// Log even when suppressed — handshake failures are anomalies worth seeing.
+		log.Printf("conn from %s: handshake FAILED post-cookie: %v", src, err)
 		return
 	}
 	defer conn.Close()
@@ -163,15 +218,30 @@ func (s *server) handle(raw net.Conn) {
 	// Splice to upstream (typically the real proxy server on loopback).
 	up, err := net.DialTimeout("tcp", s.upstream, 5*time.Second)
 	if err != nil {
-		log.Printf("dial upstream %s: %v", s.upstream, err)
+		log.Printf("conn from %s: dial upstream %s: %v", src, s.upstream, err)
 		return
 	}
 	defer up.Close()
 
+	logf("conn from %s: tunnel ESTABLISHED", src)
+
+	// Track per-direction byte counts so the close log is informative.
+	var bytesUp, bytesDown int64
 	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(up, shaped); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(shaped, up); done <- struct{}{} }()
+	go func() {
+		n, _ := io.Copy(up, shaped)
+		bytesUp = n
+		done <- struct{}{}
+	}()
+	go func() {
+		n, _ := io.Copy(shaped, up)
+		bytesDown = n
+		done <- struct{}{}
+	}()
 	<-done
+
+	logf("conn from %s: tunnel CLOSED after %s (up=%dB down=%dB)",
+		src, time.Since(startedAt).Round(time.Millisecond), bytesUp, bytesDown)
 }
 
 // probeSelf does a full client-side handshake against our own listener,
