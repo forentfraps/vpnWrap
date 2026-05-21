@@ -1,3 +1,5 @@
+!! VIBECODED - do not use in prod!!
+
 # sing-rdp
 
 RDP-DVC transport for sing-box. Wraps proxy traffic inside an RDP-shaped flow so it
