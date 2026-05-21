@@ -83,10 +83,28 @@ func main() {
 	if err != nil {
 		fatal("listen %s: %v", cfg.LocalSOCKS, err)
 	}
+
+	// Bring up the UDP relay on the same host as the TCP listener.
+	// We resolve the TCP listen host (probably 127.0.0.1) and bind UDP
+	// on an ephemeral port there. tun2socks gets that port back via the
+	// SOCKS5 UDP ASSOCIATE reply.
+	udpHost, _, _ := net.SplitHostPort(cfg.LocalSOCKS)
+	if udpHost == "" {
+		udpHost = "127.0.0.1"
+	}
+	udpRelay, err := newUDPRelay(dialer, udpHost)
+	if err != nil {
+		fatal("udp relay listen: %v", err)
+	}
+	defer udpRelay.Close()
+	go udpRelay.Run()
+
+	udpHostBind, udpPortBind := udpRelay.BindAddr()
 	log.Printf("sing-rdp-cli %s", version)
-	log.Printf("SOCKS5 listening on %s", cfg.LocalSOCKS)
-	log.Printf("upstream:           %s (cookie=%s sni=%s)", cfg.Server, cfg.Cookie, cfg.SNI)
-	log.Printf("point apps at:      socks5://%s", cfg.LocalSOCKS)
+	log.Printf("SOCKS5 (TCP) listening on %s", cfg.LocalSOCKS)
+	log.Printf("SOCKS5 (UDP) listening on %s:%d", udpHostBind, udpPortBind)
+	log.Printf("upstream:                 %s (cookie=%s sni=%s)", cfg.Server, cfg.Cookie, cfg.SNI)
+	log.Printf("point apps at:            socks5://%s", cfg.LocalSOCKS)
 
 	// Clean shutdown on Ctrl+C / Windows close. On Windows os.Interrupt
 	// fires for both Ctrl+C and Ctrl+Break.
@@ -98,7 +116,7 @@ func main() {
 		ln.Close()
 	}()
 
-	if err := ServeSOCKS5(ln, dialer, logf); err != nil {
+	if err := ServeSOCKS5(ln, dialer, udpRelay, logf); err != nil {
 		// Listener Close() returns an error here; ignore quietly.
 		if isClosed(err) {
 			return
@@ -119,6 +137,43 @@ type rdpDialer struct {
 	hostname string
 	insecure bool
 	uuid     [16]byte
+}
+
+// dialUDP is the UDP analogue of Dial. It opens a VLESS connection in
+// UDP-mode (cmd=2), which the server interprets as a multiplexed
+// packetaddr-framed UDP carrier — multiple destinations per stream.
+//
+// primaryHost / primaryPort go into the VLESS request as the initial
+// destination. sing-box requires *some* address there for inbound
+// routing, even though packetaddr lets us switch per-packet afterward.
+func (d *rdpDialer) dialUDP(ctx context.Context, primaryHost string, primaryPort uint16) (net.Conn, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	conn, err := rdp.Client(dialCtx, net.Dialer{Timeout: 10 * time.Second}, rdp.ClientConfig{
+		Address: d.server,
+		Cookie:  d.cookie,
+		Mode:    rdp.ModeStandalone,
+		TLSConfig: &tls.Config{
+			ServerName:         d.sni,
+			InsecureSkipVerify: d.insecure,
+			MinVersion:         tls.VersionTLS12,
+		},
+		Identity: credssp.MachineIdentity{
+			NetBIOSName:   d.hostname,
+			DNSName:       d.hostname,
+			NetBIOSDomain: "WORKGROUP",
+		},
+		Timeout: 30 * time.Second,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("rdp: %w", err)
+	}
+	if err := writeVLESSRequestUDP(conn, d.uuid, primaryHost, primaryPort); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("vless udp request: %w", err)
+	}
+	return NewLazyResponseStripper(conn), nil
 }
 
 func (d *rdpDialer) Dial(dst string) (net.Conn, error) {

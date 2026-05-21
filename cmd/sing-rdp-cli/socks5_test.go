@@ -58,7 +58,7 @@ func TestSOCKS5ConnectIPv4Echo(t *testing.T) {
 	}
 	defer ln.Close()
 	go func() {
-		_ = ServeSOCKS5(ln, fake, func(string, ...any) {})
+		_ = ServeSOCKS5(ln, fake, nil, func(string, ...any) {})
 	}()
 
 	c, err := net.Dial("tcp", ln.Addr().String())
@@ -122,7 +122,7 @@ func TestSOCKS5ConnectDomain(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	go func() { _ = ServeSOCKS5(ln, fake, func(string, ...any) {}) }()
+	go func() { _ = ServeSOCKS5(ln, fake, nil, func(string, ...any) {}) }()
 
 	c, _ := net.Dial("tcp", ln.Addr().String())
 	defer c.Close()
@@ -149,7 +149,7 @@ func TestSOCKS5ConnectDomain(t *testing.T) {
 func TestSOCKS5RejectsNonV5(t *testing.T) {
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
 	defer ln.Close()
-	go func() { _ = ServeSOCKS5(ln, &fakeDialer{}, func(string, ...any) {}) }()
+	go func() { _ = ServeSOCKS5(ln, &fakeDialer{}, nil, func(string, ...any) {}) }()
 
 	c, _ := net.Dial("tcp", ln.Addr().String())
 	defer c.Close()

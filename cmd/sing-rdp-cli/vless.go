@@ -31,6 +31,7 @@ import (
 const (
 	vlessVersion = 0
 	vlessCmdTCP  = 1
+	vlessCmdUDP  = 2
 
 	vlessAddrIPv4   = 1
 	vlessAddrDomain = 2
@@ -42,11 +43,27 @@ const (
 // VLESS response *and* draining it before treating subsequent bytes as
 // application data — readVLESSResponse handles that.
 func writeVLESSRequest(w io.Writer, uuid [16]byte, dstHost string, dstPort uint16) error {
+	return writeVLESSRequestCmd(w, uuid, vlessCmdTCP, dstHost, dstPort)
+}
+
+// writeVLESSRequestUDP opens a VLESS UDP-mode connection. With server-side
+// packet_encoding=packetaddr, the connection becomes a multiplexed UDP
+// pipe where each packetaddr frame carries a destination + payload.
+//
+// The dstHost/dstPort in the initial VLESS request is the "primary"
+// destination — packetaddr can switch destinations per packet, but sing-box
+// still requires *some* address here for routing decisions. We pass a
+// placeholder; the real per-packet destinations come from packetaddr.
+func writeVLESSRequestUDP(w io.Writer, uuid [16]byte, primaryHost string, primaryPort uint16) error {
+	return writeVLESSRequestCmd(w, uuid, vlessCmdUDP, primaryHost, primaryPort)
+}
+
+func writeVLESSRequestCmd(w io.Writer, uuid [16]byte, cmd byte, dstHost string, dstPort uint16) error {
 	var hdr []byte
 	hdr = append(hdr, vlessVersion)
 	hdr = append(hdr, uuid[:]...)
 	hdr = append(hdr, 0)             // addons length
-	hdr = append(hdr, vlessCmdTCP)   // command
+	hdr = append(hdr, cmd)           // command (TCP or UDP)
 	var portBuf [2]byte
 	binary.BigEndian.PutUint16(portBuf[:], dstPort)
 	hdr = append(hdr, portBuf[:]...)
