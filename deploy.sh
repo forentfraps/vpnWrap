@@ -214,8 +214,7 @@ cmd_client_config() {
         fi
     fi
 
-    # --json emits ONLY the sing-rdp-cli config blob, suitable for piping
-    # straight to a file on the client:
+    # --json emits the sing-rdp-cli (SOCKS5) config blob:
     #   ssh vps "./deploy.sh client-config --json" > sing-rdp.json
     if [[ "${1:-}" == "--json" ]]; then
         cat <<EOF
@@ -227,6 +226,27 @@ cmd_client_config() {
   "local_socks": "127.0.0.1:1080",
   "hostname":    "DESKTOP-CLIENT0",
   "insecure":    true
+}
+EOF
+        return 0
+    fi
+    # --json-tun emits the sing-rdp-tun (TUN-mode) config blob:
+    #   ssh vps "./deploy.sh client-config --json-tun" > sing-rdp.json
+    # auto_route=true: the binary will set the system default route to
+    # the TUN device — this is what makes it a "real VPN".
+    if [[ "${1:-}" == "--json-tun" ]]; then
+        cat <<EOF
+{
+  "server":      "${PUBLIC_HOST}:3389",
+  "cookie":      "${SING_RDP_COOKIE}",
+  "sni":         "${SING_RDP_SNI}",
+  "vless_uuid":  "${VLESS_UUID}",
+  "hostname":    "DESKTOP-CLIENT0",
+  "insecure":    true,
+  "tun_name":    "singrdp0",
+  "tun_address": "172.19.0.1/30",
+  "tun_mtu":     1500,
+  "auto_route":  true
 }
 EOF
         return 0
@@ -337,6 +357,18 @@ cmd_build_clients() {
         "android-armv7|linux|arm|GOARM=7|sing-rdp-client-android-armv7|./cmd/sing-rdp-client"
     )
 
+    # Bundle wintun.dll alongside the Windows binaries so the TUN client
+    # works out of the box. We pull it from the official WireGuard source.
+    # Skip silently if curl isn't available or the download fails — the
+    # SOCKS5 .exe still works without wintun.
+    if command -v curl >/dev/null 2>&1 && [[ ! -f ./dist/wintun.dll ]]; then
+        echo "fetching wintun.dll (for sing-rdp-tun on Windows)..."
+        if curl -fsSL -o /tmp/wintun.zip 'https://www.wintun.net/builds/wintun-0.14.1.zip' 2>/dev/null; then
+            unzip -p /tmp/wintun.zip 'wintun/bin/amd64/wintun.dll' > ./dist/wintun.dll 2>/dev/null || rm -f ./dist/wintun.dll
+            rm -f /tmp/wintun.zip
+        fi
+    fi
+
     local entry name os arch extra out cmd
     for entry in "${targets[@]}"; do
         IFS='|' read -r name os arch extra out cmd <<< "$entry"
@@ -345,6 +377,40 @@ cmd_build_clients() {
             export GOOS="$os" GOARCH="$arch" CGO_ENABLED=0
             [[ -n "$extra" ]] && eval "export $extra"
             go build -trimpath -ldflags="-s -w" -o "./dist/${out}" "$cmd"
+        )
+    done
+
+    # sing-rdp-tun has its own go.mod (heavy gVisor + sing-tun deps that we
+    # don't want polluting the other binaries). Build it separately for
+    # the desktop platforms only — Android via Termux doesn't get a TUN
+    # interface easily.
+    echo "building sing-rdp-tun (TUN-mode VPN client)..."
+    local tun_targets=(
+        "windows-amd64|windows|amd64|sing-rdp-tun.exe"
+        "macos-arm64|darwin|arm64|sing-rdp-tun-macos-arm64"
+        "macos-amd64|darwin|amd64|sing-rdp-tun-macos-amd64"
+        "linux-amd64|linux|amd64|sing-rdp-tun-linux-amd64"
+    )
+    local out_abs
+    out_abs="$(pwd)/dist"
+    for entry in "${tun_targets[@]}"; do
+        IFS='|' read -r name os arch out <<< "$entry"
+        echo "  ${name}: $out"
+        (
+            cd cmd/sing-rdp-tun
+            # Run go mod download/tidy once on first build so the deps are
+            # cached. Suppress output unless it fails.
+            if [[ ! -f go.sum ]]; then
+                go mod tidy >/dev/null 2>&1 || {
+                    echo "    go mod tidy failed for sing-rdp-tun — leaving TUN binary unbuilt"
+                    exit 0
+                }
+            fi
+            export GOOS="$os" GOARCH="$arch" CGO_ENABLED=0
+            go build -trimpath -ldflags="-s -w" -o "${out_abs}/${out}" . || {
+                echo "    sing-rdp-tun build failed for ${name} (likely missing deps); continuing"
+                exit 0
+            }
         )
     done
 
@@ -365,6 +431,43 @@ if not exist sing-rdp.json (
     exit /b 1
 )
 sing-rdp-cli.exe -c sing-rdp.json
+echo.
+echo (process exited — press any key to close)
+pause >nul
+BATEOF
+
+    # sing-rdp-tun needs administrator privileges (TUN creation + routing).
+    # The .bat self-elevates via PowerShell if launched without admin.
+    cat > ./dist/sing-rdp-tun.bat <<'BATEOF'
+@echo off
+REM Launcher for sing-rdp-tun.exe (TUN-mode VPN client).
+REM Self-elevates to administrator if not already. Requires wintun.dll
+REM in the same folder.
+
+setlocal
+cd /d "%~dp0"
+
+REM Check for admin: 'net session' fails without elevation.
+net session >nul 2>&1
+if %errorlevel% neq 0 (
+    echo Requesting administrator rights...
+    powershell -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+    exit /b
+)
+
+if not exist wintun.dll (
+    echo wintun.dll missing from %CD%
+    echo Download from https://www.wintun.net/ and place beside the .exe
+    pause
+    exit /b 1
+)
+if not exist sing-rdp.json (
+    echo sing-rdp.json not found in %CD%
+    pause
+    exit /b 1
+)
+
+sing-rdp-tun.exe -c sing-rdp.json
 echo.
 echo (process exited — press any key to close)
 pause >nul
