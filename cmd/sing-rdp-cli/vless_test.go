@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"io"
+	"net"
 	"testing"
+	"time"
 )
 
 func TestParseUUID(t *testing.T) {
@@ -122,3 +125,62 @@ func TestVLESSResponseSkipsAddons(t *testing.T) {
 		t.Errorf("addons not drained: %d bytes left", buf.Len())
 	}
 }
+
+// TestLazyResponseStripper regresses the deadlock where readVLESSResponse
+// was called before SOCKS5 success was sent, leaving the browser silent
+// and sing-box's wait-for-data optimization holding the response.
+func TestLazyResponseStripper(t *testing.T) {
+	// Simulate a server-side stream: 2-byte VLESS response + app data.
+	stream := []byte{
+		0, 0, // version=0, addons_len=0  (the response we want stripped)
+		'H', 'e', 'l', 'l', 'o', // application data
+	}
+	lazy := NewLazyResponseStripper(&fakeConn{r: bytes.NewReader(stream)})
+
+	// First read should hide the response prefix and surface app data.
+	buf := make([]byte, 32)
+	n, err := lazy.Read(buf)
+	if err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	if string(buf[:n]) != "Hello" {
+		t.Errorf("got %q want %q", buf[:n], "Hello")
+	}
+
+	// Second read should hit EOF on the inner reader.
+	_, err = lazy.Read(buf)
+	if err != io.EOF {
+		t.Errorf("expected EOF, got %v", err)
+	}
+}
+
+func TestLazyResponseStripperWithAddons(t *testing.T) {
+	stream := []byte{
+		0, 3, 'a', 'b', 'c', // version + addons_len=3 + 3 addon bytes
+		'O', 'K',
+	}
+	lazy := NewLazyResponseStripper(&fakeConn{r: bytes.NewReader(stream)})
+
+	buf := make([]byte, 32)
+	n, err := lazy.Read(buf)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(buf[:n]) != "OK" {
+		t.Errorf("got %q want %q", buf[:n], "OK")
+	}
+}
+
+// fakeConn is a minimal net.Conn adaptor over a Reader for these tests.
+type fakeConn struct {
+	r io.Reader
+}
+
+func (f *fakeConn) Read(p []byte) (int, error)        { return f.r.Read(p) }
+func (f *fakeConn) Write(p []byte) (int, error)       { return len(p), nil }
+func (f *fakeConn) Close() error                      { return nil }
+func (f *fakeConn) LocalAddr() net.Addr               { return nil }
+func (f *fakeConn) RemoteAddr() net.Addr              { return nil }
+func (f *fakeConn) SetDeadline(time.Time) error       { return nil }
+func (f *fakeConn) SetReadDeadline(time.Time) error   { return nil }
+func (f *fakeConn) SetWriteDeadline(time.Time) error  { return nil }

@@ -154,17 +154,24 @@ func (d *rdpDialer) Dial(dst string) (net.Conn, error) {
 		return nil, fmt.Errorf("rdp: %w", err)
 	}
 
-	// Speak VLESS on the inner stream: send CONNECT, drain response,
-	// then return a conn whose subsequent IO is the application data.
+	// Speak VLESS on the inner stream. Critical: do NOT block waiting for
+	// the response before returning. sing-box's VLESS server holds the
+	// 2-byte response until application data flows from either side; the
+	// SOCKS5 layer (our caller) holds its success reply until Dial()
+	// returns; the browser holds application data until it sees SOCKS5
+	// success. Three-way deadlock. Symptom: every connection sat idle for
+	// ~15s with up=36B down=0B in the server logs.
+	//
+	// Fix: send the request, wrap the conn so the first Read lazily
+	// strips the VLESS response, return immediately. SOCKS5 success goes
+	// out, browser sends data, sing-box-inner's optimization triggers,
+	// response + initial data come back, the stripper consumes the
+	// 2-byte response transparently.
 	if err := writeVLESSRequest(conn, d.uuid, host, port); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("vless request: %w", err)
 	}
-	if _, err := readVLESSResponse(conn); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("vless response: %w", err)
-	}
-	return conn, nil
+	return NewLazyResponseStripper(conn), nil
 }
 
 func parsePort(s string) (uint16, error) {

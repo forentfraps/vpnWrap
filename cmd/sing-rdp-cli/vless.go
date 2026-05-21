@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 )
 
 // VLESS protocol request layout — what we send as the first bytes of the
@@ -75,6 +76,14 @@ func writeVLESSRequest(w io.Writer, uuid [16]byte, dstHost string, dstPort uint1
 // readVLESSResponse consumes the VLESS server response. Must be called once
 // before reading application data. Returns the response version byte (for
 // future use) or an error.
+//
+// Note: prefer LazyResponseStripper for client-side use. Calling this
+// synchronously between writeVLESSRequest and returning the conn to the
+// SOCKS5 layer can deadlock against sing-box's "wait for first data byte
+// before sending the response" optimization — the server holds the
+// response until the client sends application data, the client holds the
+// SOCKS5 success reply until it gets the response, the browser holds
+// application data until it gets SOCKS5 success.
 func readVLESSResponse(r io.Reader) (byte, error) {
 	var hdr [2]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
@@ -88,4 +97,44 @@ func readVLESSResponse(r io.Reader) (byte, error) {
 		}
 	}
 	return hdr[0], nil
+}
+
+// LazyResponseStripper wraps a conn so that its first Read consumes and
+// discards the VLESS server response (version + addons). Subsequent Reads
+// pass through unchanged.
+//
+// Why this exists: see the doc comment on readVLESSResponse. By deferring
+// the response read until *after* the client has flushed its first chunk
+// of application data, we sidestep the deadlock with sing-box's
+// optimization where it holds the response back until either side speaks.
+type LazyResponseStripper struct {
+	net.Conn
+	once    sync.Once
+	stripErr error
+}
+
+// NewLazyResponseStripper returns a wrapped conn ready to use.
+func NewLazyResponseStripper(c net.Conn) *LazyResponseStripper {
+	return &LazyResponseStripper{Conn: c}
+}
+
+func (l *LazyResponseStripper) Read(p []byte) (int, error) {
+	l.once.Do(func() {
+		var hdr [2]byte
+		if _, err := io.ReadFull(l.Conn, hdr[:]); err != nil {
+			l.stripErr = fmt.Errorf("vless: read response: %w", err)
+			return
+		}
+		if hdr[1] > 0 {
+			// Drain addons block without allocating.
+			if _, err := io.CopyN(io.Discard, l.Conn, int64(hdr[1])); err != nil {
+				l.stripErr = fmt.Errorf("vless: skip addons: %w", err)
+				return
+			}
+		}
+	})
+	if l.stripErr != nil {
+		return 0, l.stripErr
+	}
+	return l.Conn.Read(p)
 }
