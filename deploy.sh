@@ -393,22 +393,36 @@ cmd_build_clients() {
     )
     local out_abs
     out_abs="$(pwd)/dist"
+    # If go.mod has been bumped (newer version pinned) but go.sum is from
+    # an earlier build with different versions, `go build` fails with
+    # cryptic errors. Detect a version bump by checking if go.sum
+    # references the current sing-tun version, and regenerate if not.
+    if [[ -f cmd/sing-rdp-tun/go.sum ]]; then
+        local pinned current
+        pinned=$(grep -oE 'sing-tun v[0-9]+\.[0-9]+\.[0-9]+' cmd/sing-rdp-tun/go.mod | head -1 | awk '{print $2}')
+        current=$(grep -oE 'sing-tun v[0-9]+\.[0-9]+\.[0-9]+' cmd/sing-rdp-tun/go.sum | head -1 | awk '{print $2}')
+        if [[ -n "$pinned" && -n "$current" && "$pinned" != "$current" ]]; then
+            echo "  sing-tun version bumped ($current -> $pinned); regenerating go.sum"
+            rm cmd/sing-rdp-tun/go.sum
+        fi
+    fi
+
     for entry in "${tun_targets[@]}"; do
         IFS='|' read -r name os arch out <<< "$entry"
         echo "  ${name}: $out"
         (
             cd cmd/sing-rdp-tun
             # Run go mod download/tidy once on first build so the deps are
-            # cached. Suppress output unless it fails.
+            # cached. Run it again if go.sum is missing (version bump).
             if [[ ! -f go.sum ]]; then
-                go mod tidy >/dev/null 2>&1 || {
+                go mod tidy 2>&1 || {
                     echo "    go mod tidy failed for sing-rdp-tun — leaving TUN binary unbuilt"
                     exit 0
                 }
             fi
             export GOOS="$os" GOARCH="$arch" CGO_ENABLED=0
             go build -trimpath -ldflags="-s -w" -o "${out_abs}/${out}" . || {
-                echo "    sing-rdp-tun build failed for ${name} (likely missing deps); continuing"
+                echo "    sing-rdp-tun build failed for ${name} — continuing without TUN binary"
                 exit 0
             }
         )

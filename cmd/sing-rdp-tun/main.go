@@ -196,5 +196,3 @@ func fatal(format string, args ...any) {
 	os.Exit(1)
 }
 
-// Force linter to keep `net` imported when only its package is referenced.
-var _ = (*net.Conn)(nil)
