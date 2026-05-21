@@ -396,6 +396,8 @@ cmd_build_clients() {
     # Drop a tiny launcher beside the Windows .exe so users can
     # double-click instead of opening PowerShell. It also pauses on
     # error so a misconfigured json isn't a flash-then-gone console.
+    # NOTE: ASCII-only — Windows cmd.exe in cp866/cp1252 mangles
+    # multibyte characters into garbage like "тАФ".
     cat > ./dist/sing-rdp-cli.bat <<'BATEOF'
 @echo off
 REM Tiny launcher for sing-rdp-cli.exe. Place this file next to the .exe
@@ -411,9 +413,13 @@ if not exist sing-rdp.json (
 )
 sing-rdp-cli.exe -c sing-rdp.json
 echo.
-echo (process exited — press any key to close)
+echo (process exited -- press any key to close)
 pause >nul
 BATEOF
+
+    # Wipe orphaned launcher from earlier dev iterations — sing-rdp-tun.exe
+    # no longer exists, so its .bat just confuses users.
+    rm -f ./dist/sing-rdp-tun.bat
 
     # Note: the launcher for system-wide TUN-mode VPN (sing-rdp-vpn.bat)
     # is written by `./deploy.sh fetch-tun2socks` because it depends on
