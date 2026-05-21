@@ -23,12 +23,14 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -42,26 +44,105 @@ import (
 var (
 	flagConfig  = flag.String("c", "sing-rdp.json", "path to JSON config file")
 	flagVerbose = flag.Bool("v", false, "verbose logging")
-	flagTUN     = flag.Bool("tun", false, "enable system-wide TUN mode (Windows: needs admin + tun2socks.exe + wintun.dll alongside)")
+	flagTUN     = flag.Bool("tun", false, "enable system-wide TUN mode (needs admin; auto-prompts on Windows)")
+	flagMenu    = flag.Bool("menu", false, "force the interactive launch menu even when other flags are set")
+	flagNoMenu  = flag.Bool("no-menu", false, "never show the interactive launch menu (script-friendly)")
 )
 
 const version = "0.1.0"
 
 func main() {
+	enableANSI()
+
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "sing-rdp-cli %s\n\n", version)
-		fmt.Fprintf(os.Stderr, "Usage: %s [-c sing-rdp.json] [-v]\n\n", os.Args[0])
-		fmt.Fprintln(os.Stderr, "Reads sing-rdp.json (see ./deploy.sh client-config --json on the VPS)")
-		fmt.Fprintln(os.Stderr, "and starts a local SOCKS5 listener. Point your browser at it.")
+		fmt.Fprintf(os.Stderr, "Usage: %s [-c sing-rdp.json] [-tun] [-v]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "       %s            (no args: launch interactive menu)\n\n", os.Args[0])
+		fmt.Fprintln(os.Stderr, "Reads sing-rdp.json (see ./deploy.sh client-config --json on the VPS).")
+		fmt.Fprintln(os.Stderr, "With -tun, brings up a system-wide TUN VPN. Without it, runs a local SOCKS5.")
 		fmt.Fprintln(os.Stderr)
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 
+	// chdir to the binary's directory so a double-click launch finds
+	// sing-rdp.json regardless of where Explorer set the CWD. We only
+	// do this when the user didn't pass an absolute config path —
+	// otherwise we'd defeat their explicit choice.
+	if !filepath.IsAbs(*flagConfig) {
+		chdirToExeDir()
+	}
+
+	// Decide whether to show the interactive menu. Default: show it
+	// when the user didn't pass any flags AND stdin looks like a real
+	// terminal (i.e., this is a double-click launch). The -menu and
+	// -no-menu flags let callers force either way.
+	interactive := *flagMenu || (flag.NFlag() == 0 && stdinIsInteractive() && !*flagNoMenu)
+	if *flagNoMenu {
+		interactive = false
+	}
+
 	cfg, err := LoadConfig(*flagConfig)
 	if err != nil {
 		fatal("config: %v", err)
 	}
+
+	// Interactive menu — pick TUN vs SOCKS5 by typing 1/2/q.
+	if interactive {
+		printBanner(os.Stdout)
+		printStatus(os.Stdout, cfg, isElevated())
+		switch showMenu(os.Stdout, os.Stdin, isElevated()) {
+		case choiceQuit:
+			fmt.Println()
+			fmt.Printf("  %sbye%s\n", cDim, cReset)
+			pressEnterToClose(os.Stdout, os.Stdin)
+			return
+		case choiceTUN:
+			*flagTUN = true
+		case choiceSOCKS5:
+			*flagTUN = false
+		}
+	}
+
+	// TUN mode needs admin. If we're not elevated, relaunch ourselves
+	// through UAC and exit — the child will run the real work. We
+	// pass through the user's chosen flags plus -elevated so the new
+	// process knows it shouldn't show the menu again.
+	if *flagTUN && !isElevated() {
+		fmt.Println()
+		fmt.Printf("  %sTUN mode needs administrator rights — requesting elevation...%s\n", cYellow, cReset)
+		relaunchArgs := []string{"-c", *flagConfig, "-tun", "-no-menu"}
+		if *flagVerbose {
+			relaunchArgs = append(relaunchArgs, "-v")
+		}
+		if err := relaunchElevated(relaunchArgs); err != nil {
+			if errors.Is(err, errUserCancelled) {
+				fmt.Printf("  %sUAC cancelled. VPN not started.%s\n", cYellow, cReset)
+			} else {
+				fmt.Printf("  %selevation failed:%s %v\n", cRed, cReset, err)
+			}
+			if interactive {
+				pressEnterToClose(os.Stdout, os.Stdin)
+			}
+			os.Exit(1)
+		}
+		// The child process owns the console window now; nothing left
+		// to do here.
+		return
+	}
+
+	// Whether we showed the menu or not, give the user a nice header
+	// once the work is actually starting. This subsumes the old
+	// "sing-rdp-cli 0.1.0 / SOCKS5 listening on ..." block.
+	if !interactive {
+		printBanner(os.Stdout)
+	}
+	runInteractive = interactive
+	defer func() {
+		if interactive {
+			pressEnterToClose(os.Stdout, os.Stdin)
+		}
+	}()
 
 	uuid, err := parseUUID(cfg.VLESSUUID)
 	if err != nil {
@@ -104,11 +185,7 @@ func main() {
 	go udpRelay.Run()
 
 	udpHostBind, udpPortBind := udpRelay.BindAddr()
-	log.Printf("sing-rdp-cli %s", version)
-	log.Printf("SOCKS5 (TCP) listening on %s", cfg.LocalSOCKS)
-	log.Printf("SOCKS5 (UDP) listening on %s:%d", udpHostBind, udpPortBind)
-	log.Printf("upstream:                 %s (cookie=%s sni=%s)", cfg.Server, cfg.Cookie, cfg.SNI)
-	log.Printf("point apps at:            socks5://%s", cfg.LocalSOCKS)
+	printRunHeader(cfg, udpHostBind, udpPortBind, *flagTUN)
 
 	// Single cancellable context drives shutdown of everything that
 	// might be running — the SOCKS5 listener, the TUN orchestration,
@@ -269,9 +346,59 @@ func parsePort(s string) (uint16, error) {
 	return uint16(p), nil
 }
 
+// runInteractive is set by main() when the launcher is being driven by
+// a user at a console (vs. a script). fatal() reads it to decide whether
+// to wait for an "enter to close" keypress before exiting, so an error
+// message doesn't flash and vanish along with the console window.
+var runInteractive bool
+
 func fatal(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "sing-rdp-cli: "+format+"\n", args...)
+	fmt.Fprintf(os.Stderr, "%ssing-rdp-cli: %s%s\n",
+		cRed, fmt.Sprintf(format, args...), cReset)
+	if runInteractive {
+		pressEnterToClose(os.Stdout, os.Stdin)
+	}
 	os.Exit(1)
+}
+
+// chdirToExeDir moves the process CWD to the binary's own directory.
+// We call this at startup because a double-click launch on Windows
+// leaves CWD pointing at the user's home (or wherever Explorer thinks),
+// which means relative paths like "sing-rdp.json" won't resolve.
+//
+// Best-effort: if either step fails we just leave CWD alone and the
+// subsequent LoadConfig() call surfaces a regular "file not found" error.
+func chdirToExeDir() {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	_ = os.Chdir(filepath.Dir(exe))
+}
+
+// printRunHeader prints the "we're up and listening" block in the same
+// visual style as the banner — boxed-ish, color-accented, no log
+// timestamps in front of it. Replaces the four log.Printf lines that
+// used to scroll past in the old startup.
+func printRunHeader(cfg *Config, udpHost string, udpPort uint16, tun bool) {
+	mode := cGreen + "SOCKS5 only" + cReset
+	if tun {
+		mode = cGreen + "FULL VPN (TUN)" + cReset
+	}
+	row := func(label, value string) {
+		fmt.Printf("    %s%-12s%s %s\n", cDim, label, cReset, value)
+	}
+	fmt.Println()
+	fmt.Printf("  %sRunning%s — %s\n", cBold, cReset, mode)
+	row("socks5 tcp:", fmt.Sprintf("%s", cfg.LocalSOCKS))
+	row("socks5 udp:", fmt.Sprintf("%s:%d", udpHost, udpPort))
+	row("upstream:", fmt.Sprintf("%s  %s(sni=%s)%s", cfg.Server, cDim, cfg.SNI, cReset))
+	if tun {
+		row("tun mode:", cGreen+"all OS traffic routes through the VPN"+cReset)
+	} else {
+		row("apps:", fmt.Sprintf("point them at %ssocks5://%s%s", cBold, cfg.LocalSOCKS, cReset))
+	}
+	fmt.Printf("\n  %sPress Ctrl+C to stop.%s\n\n", cDim, cReset)
 }
 
 func isClosed(err error) bool {

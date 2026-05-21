@@ -202,11 +202,8 @@ func runTUN(ctx context.Context, cfg *Config) error {
 	}
 
 	fmt.Println()
-	fmt.Println("============================================================")
-	fmt.Printf("  VPN is UP. All traffic now routes through %s\n", vpsHost)
-	fmt.Println("  Press Ctrl+C to stop.")
-	fmt.Println("============================================================")
-	fmt.Println()
+	fmt.Printf("  %s✓ VPN is UP%s — all traffic now routes through %s%s%s\n\n",
+		cGreen+cBold, cReset, cBold, vpsHost, cReset)
 
 	// --- 5. Supervise --------------------------------------------------
 	select {

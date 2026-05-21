@@ -19,8 +19,9 @@ tunnel — no SOCKS5 proxy config per-app, no browser-specific setup.
 ```
 
 Two binaries chained together. `tun2socks` handles the OS-level TUN
-device + routing; `sing-rdp-cli` handles the actual tunneling. A single
-`.bat` starts both.
+device + routing; `sing-rdp-cli` handles the actual tunneling. Just
+double-click `sing-rdp-cli.exe` — it spawns `tun2socks` itself and
+prompts UAC when needed.
 
 ## Why two binaries and not one
 
@@ -53,11 +54,9 @@ ls -la ./dist/
 You'll see:
 
 ```
-sing-rdp-cli.exe                  # our SOCKS5 client
+sing-rdp-cli.exe                  # our all-in-one client (self-elevating, menu UI)
 tun2socks-windows-amd64.exe       # OS TUN <-> SOCKS5 bridge
-wintun.dll                        # Wintun driver shim (already there)
-sing-rdp-vpn.bat                  # self-elevating launcher
-sing-rdp-cli.bat                  # SOCKS5-only launcher (alternative)
+wintun.dll                        # Wintun driver shim
 ```
 
 Plus the macOS / Linux variants of `tun2socks-*`.
@@ -82,29 +81,50 @@ cd C:\sing-rdp
 scp user@vps:/root/vpnWrap/dist/sing-rdp-cli.exe .
 scp user@vps:/root/vpnWrap/dist/tun2socks-windows-amd64.exe .
 scp user@vps:/root/vpnWrap/dist/wintun.dll .
-scp user@vps:/root/vpnWrap/dist/sing-rdp-vpn.bat .
 scp user@vps:/root/vpnWrap/sing-rdp.json .
 ```
 
-Five files in `C:\sing-rdp\`. Done.
+Four files in `C:\sing-rdp\`. Done.
 
 ### Run
 
-**Double-click `sing-rdp-vpn.bat`.** UAC prompt → accept. A console
-window opens showing:
+**Double-click `sing-rdp-cli.exe`.** A console window opens with an
+interactive menu:
 
 ```
-Starting sing-rdp-cli (SOCKS5 on 127.0.0.1:1080)...
-sing-rdp-cli 0.1.0
-SOCKS5 listening on 127.0.0.1:1080
-Starting tun2socks (TUN device + system route)...
-INFO[0000] [STACK] tun://wintun
-INFO[0000] [PROXY] socks5://127.0.0.1:1080
-INFO[0000] [TUN] gateway routed
+  ╔══════════════════════════════════════════════════════════════╗
+  ║                                                              ║
+  ║   sing-rdp-cli  ·  v0.1.0                                    ║
+  ║   RDP-wrapped VLESS VPN client                               ║
+  ║                                                              ║
+  ╚══════════════════════════════════════════════════════════════╝
+
+    Config
+    server:       vps.example.com:3389
+    sni:          DESKTOP-XYZ
+    socks5:       127.0.0.1:1080
+    admin:        no  (run as admin to enable TUN mode)
+
+  What would you like to do?
+
+    [1]  Start full VPN  (system-wide TUN) — will prompt for admin
+    [2]  Start SOCKS5 proxy  (apps connect to 127.0.0.1:1080)
+    [q]  Quit
+
+  Choose [1]:
 ```
 
-Every TCP connection from every app on your machine now goes through
-the VPS. No per-app proxy config.
+Hit Enter (or type `1`) → UAC prompt → accept. A new console opens
+showing the live tunnel state. Every TCP/UDP connection from every app
+on your machine now goes through the VPS — no per-app proxy config.
+
+Power users can skip the menu by passing flags directly:
+
+```powershell
+sing-rdp-cli.exe -tun          # request UAC, run full VPN
+sing-rdp-cli.exe               # interactive menu (default)
+sing-rdp-cli.exe -no-menu      # SOCKS5 only, no menu (scriptable)
+```
 
 ### Verify
 
@@ -117,24 +137,17 @@ curl.exe https://api.ipify.org
 ### Stop
 
 Close the console window or press **Ctrl+C** inside it. The TUN
-interface and routes are torn down automatically. `sing-rdp-cli.exe`
-is killed by the cleanup tail of the .bat.
+interface and routes are torn down automatically, then `sing-rdp-cli`
+exits — it kills its own `tun2socks` child as part of cleanup.
 
 ## Caveats
 
 ### UDP
 
-tun2socks supports UDP tunneling natively over SOCKS5. **But** sing-rdp-cli
-(our SOCKS5 server) only forwards TCP — UDP packets from tun2socks will
-be dropped. Consequences and workarounds same as before:
-
-- DNS over UDP won't work. Use DoH in your browser, or set system DNS
-  to a public DoT/DoH resolver.
-- QUIC / HTTP/3 won't work; browsers fall back to TCP-based HTTP/2.
-- Online games using UDP won't work.
-
-Adding UDP support is a future TODO — it needs xudp (UDP over VLESS) on
-both ends.
+UDP works end-to-end. `sing-rdp-cli` exposes a SOCKS5 UDP ASSOCIATE
+relay and multiplexes outbound datagrams through the VLESS server using
+`packetaddr` framing, so DNS, QUIC/HTTP3, and apps like Discord voice
+all route through the tunnel.
 
 ### Performance
 
@@ -146,7 +159,7 @@ the RDP layer is a future optimization.
 
 If `sing-rdp-cli.exe` dies (crash, killed manually), `tun2socks.exe`
 keeps running but every SOCKS5 dial fails — apps see "connection refused"
-until you restart the .bat. Watchdog logic is on the TODO list.
+until you restart `sing-rdp-cli.exe`. Watchdog logic is on the TODO list.
 
 ### What about Linux / macOS?
 
@@ -168,6 +181,6 @@ launchers exist as shell scripts:
 |---|---|
 | UAC prompt loops | Windows policy blocks elevation — check Group Policy / antivirus |
 | "wintun.dll missing" | Copy `wintun.dll` next to the .exe |
-| tun2socks: "create interface failed" | Not running as admin; use the .bat |
+| tun2socks: "create interface failed" | Not running as admin; pick option [1] from the menu (UAC) instead of [2] |
 | Apps don't route through VPN | Old route table cached; reboot or `route delete 0.0.0.0` and restart |
 | sing-rdp-cli logs show connections, browser still loads from home IP | Browser cached the previous network state — close and reopen browser |

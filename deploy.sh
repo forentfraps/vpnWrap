@@ -22,10 +22,10 @@
 #                              other platforms, build from source.
 #   ./deploy.sh fetch-tun2socks
 #                              download tun2socks (xjasonlyu) prebuilt
-#                              binaries + write sing-rdp-vpn.bat. Pairs with
-#                              sing-rdp-cli.exe for a real TUN-mode VPN.
-#                              Pragmatic alternative to sing-rdp-tun while
-#                              that source stabilizes upstream.
+#                              binaries. Pairs with sing-rdp-cli.exe -tun
+#                              for a real TUN-mode VPN. Pragmatic
+#                              alternative to sing-rdp-tun while that
+#                              source stabilizes upstream.
 #   ./deploy.sh build-clients  cross-compile all client binaries to ./dist/:
 #                              - sing-rdp-cli.exe              (Windows)
 #                              - sing-rdp-cli-macos-{arm64,amd64}
@@ -393,45 +393,24 @@ cmd_build_clients() {
     # See cmd_fetch_tun2socks below.
     :
 
-    # Drop a tiny launcher beside the Windows .exe so users can
-    # double-click instead of opening PowerShell. It also pauses on
-    # error so a misconfigured json isn't a flash-then-gone console.
-    # NOTE: ASCII-only — Windows cmd.exe in cp866/cp1252 mangles
-    # multibyte characters into garbage like "тАФ".
-    cat > ./dist/sing-rdp-cli.bat <<'BATEOF'
-@echo off
-REM Tiny launcher for sing-rdp-cli.exe. Place this file next to the .exe
-REM and your sing-rdp.json, then double-click to run.
-
-setlocal
-cd /d "%~dp0"
-if not exist sing-rdp.json (
-    echo sing-rdp.json not found in %CD%
-    echo Place the config file next to this script and try again.
-    pause
-    exit /b 1
-)
-sing-rdp-cli.exe -c sing-rdp.json
-echo.
-echo (process exited -- press any key to close)
-pause >nul
-BATEOF
-
-    # Wipe orphaned launcher from earlier dev iterations — sing-rdp-tun.exe
-    # no longer exists, so its .bat just confuses users.
-    rm -f ./dist/sing-rdp-tun.bat
+    # No .bat wrappers — sing-rdp-cli.exe handles all of this itself:
+    #   * double-clicking the .exe opens the interactive launch menu
+    #   * picking "Start full VPN" auto-prompts UAC (built-in ShellExecute)
+    #   * config is looked up next to the .exe regardless of CWD
+    # Wipe any stale launchers from older builds so users aren't confused
+    # by ghost files in their dist/ folder.
+    rm -f ./dist/sing-rdp-cli.bat ./dist/sing-rdp-vpn.bat ./dist/sing-rdp-tun.bat ./dist/sing-rdp-vpn.ps1
 
     # TUN-mode dependencies: fetch the prebuilt tun2socks binaries from
-    # xjasonlyu/tun2socks releases and write the self-elevating
-    # sing-rdp-vpn.bat. sing-rdp-cli -tun spawns tun2socks alongside
-    # itself; both binaries (and wintun.dll, and the config) live in
-    # the same dist/ folder.
+    # xjasonlyu/tun2socks releases. sing-rdp-cli.exe -tun spawns tun2socks
+    # alongside itself; both binaries (and wintun.dll, and the config)
+    # live in the same dist/ folder.
     fetch_tun2socks_into_dist
 
     echo
     echo "built:"
     ls -lh ./dist/sing-rdp-cli* ./dist/sing-rdp-client* 2>/dev/null | awk '{print "  "$NF" ("$5")"}'
-    ls -lh ./dist/tun2socks-* ./dist/wintun.dll ./dist/sing-rdp-vpn.bat 2>/dev/null | awk '{print "  "$NF" ("$5")"}'
+    ls -lh ./dist/tun2socks-* ./dist/wintun.dll 2>/dev/null | awk '{print "  "$NF" ("$5")"}'
 }
 
 fetch_tun2socks_into_dist() {
@@ -475,29 +454,10 @@ fetch_tun2socks_into_dist() {
         rm -rf "$tmp"
     done
 
-    # Tiny self-elevating launcher. All the orchestration logic is now
-    # inside sing-rdp-cli's -tun mode, so this is just a 5-line shim.
-    cat > ./dist/sing-rdp-vpn.bat <<'BATEOF'
-@echo off
-REM Self-elevating launcher for full TUN-mode VPN.
-REM All routing/supervision lives inside sing-rdp-cli.exe -tun; this .bat
-REM just gains admin and exits.
-setlocal
-cd /d "%~dp0"
-net session >nul 2>&1
-if %errorlevel% neq 0 (
-    powershell -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
-    exit /b
-)
-sing-rdp-cli.exe -c sing-rdp.json -tun
-echo.
-echo (VPN stopped -- press any key to close)
-pause >nul
-BATEOF
-
-    # Remove the legacy PowerShell orchestrator if it's lingering from
-    # an earlier build.
-    rm -f ./dist/sing-rdp-vpn.ps1
+    # Remove any stale launchers from older dev iterations — the .exe
+    # now self-elevates and shows its own menu, so the .bat / .ps1
+    # wrappers only serve to confuse.
+    rm -f ./dist/sing-rdp-vpn.bat ./dist/sing-rdp-vpn.ps1
 }
 
 # Legacy alias — kept so anyone with the old command in muscle memory
