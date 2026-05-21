@@ -30,6 +30,12 @@
 #                              sing-box needed). Android uses Termux +
 #                              NekoBox per docs/mobile-android.md.
 #   ./deploy.sh build-mobile   alias for build-clients (legacy).
+#   ./deploy.sh doctor         run local checks: is sing-rdp listening on
+#                              a public interface, is /healthz green, is
+#                              UFW allowing 3389, are iptables rules
+#                              dropping it. Prints the command for the
+#                              external reachability test you should run
+#                              from another machine.
 #   ./deploy.sh rotate         generate a new identity + restart. The old
 #                              cookie is invalidated; clients need the new
 #                              cookie to reconnect.
@@ -342,9 +348,31 @@ cmd_build_clients() {
         )
     done
 
+    # Drop a tiny launcher beside the Windows .exe so users can
+    # double-click instead of opening PowerShell. It also pauses on
+    # error so a misconfigured json isn't a flash-then-gone console.
+    cat > ./dist/sing-rdp-cli.bat <<'BATEOF'
+@echo off
+REM Tiny launcher for sing-rdp-cli.exe. Place this file next to the .exe
+REM and your sing-rdp.json, then double-click to run.
+
+setlocal
+cd /d "%~dp0"
+if not exist sing-rdp.json (
+    echo sing-rdp.json not found in %CD%
+    echo Place the config file next to this script and try again.
+    pause
+    exit /b 1
+)
+sing-rdp-cli.exe -c sing-rdp.json
+echo.
+echo (process exited — press any key to close)
+pause >nul
+BATEOF
     echo
     echo "built:"
     ls -lh ./dist/sing-rdp-* 2>/dev/null | awk '{print "  "$NF" ("$5")"}'
+    echo "  ./dist/sing-rdp-cli.bat  (Windows launcher)"
 }
 
 cmd_export_client() {
@@ -371,6 +399,114 @@ cmd_export_client() {
     echo "or cross-compile from this VPS for your target:"
     echo "  GOOS=darwin GOARCH=arm64 go build -o sing-rdp-client-mac ./cmd/sing-rdp-client"
     echo "  GOOS=windows GOARCH=amd64 go build -o sing-rdp-client.exe ./cmd/sing-rdp-client"
+}
+
+cmd_doctor() {
+    need_env
+    local port="${SING_RDP_PORT:-3389}"
+    local health_port=9180
+    local exit_code=0
+    local ok="\033[32m✓\033[0m" bad="\033[31m✗\033[0m" warn="\033[33m!\033[0m"
+
+    say() { printf "  %b  %s\n" "$1" "$2"; }
+
+    echo "=== sing-rdp doctor ==="
+    echo
+
+    # --- 1. Is the service listening? ---
+    echo "[1/5] listener state"
+    if ! command -v ss >/dev/null 2>&1; then
+        say "$warn" "'ss' not installed — install iproute2 for this check"
+    else
+        local listen_line
+        listen_line=$(ss -tlnH "sport = :${port}" 2>/dev/null | head -1)
+        if [[ -z "$listen_line" ]]; then
+            say "$bad" "nothing listening on :${port}"
+            say "" "  fix: ./deploy.sh up"
+            exit_code=1
+        elif echo "$listen_line" | grep -qE '127\.0\.0\.1|\[::1\]'; then
+            say "$bad" "listening on loopback only — external clients can't reach it"
+            say "" "  fix: check SING_RDP_LISTEN env / docker-compose.yml"
+            exit_code=1
+        else
+            say "$ok"  "listening on $(echo "$listen_line" | awk '{print $4}')"
+        fi
+    fi
+
+    # --- 2. Local handshake works? ---
+    echo "[2/5] in-process /healthz"
+    if curl -sf --max-time 3 "http://127.0.0.1:${health_port}/healthz" >/dev/null 2>&1; then
+        local body; body=$(curl -s "http://127.0.0.1:${health_port}/healthz")
+        if echo "$body" | grep -q '"ok":true'; then
+            say "$ok" "healthz reports ok:true"
+        else
+            say "$bad" "healthz reports failure: $body"
+            exit_code=1
+        fi
+    else
+        say "$bad" "healthz unreachable on 127.0.0.1:${health_port}"
+        exit_code=1
+    fi
+
+    # --- 3. UFW status ---
+    echo "[3/5] UFW"
+    if ! command -v ufw >/dev/null 2>&1; then
+        say "$warn" "ufw not installed (probably fine — but no local firewall check)"
+    else
+        local ufw_state; ufw_state=$(ufw status 2>/dev/null | head -1)
+        if echo "$ufw_state" | grep -q "inactive"; then
+            say "$ok" "ufw inactive (nothing blocking locally)"
+        elif ufw status 2>/dev/null | grep -qE "^${port}/tcp +ALLOW"; then
+            say "$ok" "ufw allows ${port}/tcp"
+        else
+            say "$bad" "ufw is active and no rule allows ${port}/tcp"
+            say "" "  fix: ufw allow ${port}/tcp"
+            exit_code=1
+        fi
+    fi
+
+    # --- 4. iptables / Docker chain ---
+    echo "[4/5] iptables raw view"
+    if command -v iptables >/dev/null 2>&1 && [[ $EUID -eq 0 ]]; then
+        local drops; drops=$(iptables -L INPUT -n 2>/dev/null | grep -E "dpt:${port} *$" | grep -E "DROP|REJECT" || true)
+        if [[ -n "$drops" ]]; then
+            say "$bad" "INPUT chain rejects ${port}:"
+            echo "$drops" | sed 's/^/      /'
+            exit_code=1
+        else
+            say "$ok" "no INPUT-chain DROP/REJECT for ${port}"
+        fi
+    else
+        say "$warn" "skipped (need root + iptables)"
+    fi
+
+    # --- 5. External reachability hint ---
+    echo "[5/5] external reachability"
+    local pub_ip; pub_ip=$(detect_public_ip 2>/dev/null || echo "")
+    if [[ -n "$pub_ip" ]]; then
+        say "$ok" "public IP = ${pub_ip}"
+        echo
+        echo "Test from outside (a machine that isn't this VPS):"
+        echo "    nc -zv ${pub_ip} ${port}"
+        echo "    # or in PowerShell:"
+        echo "    Test-NetConnection -ComputerName ${pub_ip} -Port ${port}"
+        echo "    # or via web:"
+        echo "    https://portchecker.io  (ip=${pub_ip} port=${port})"
+    else
+        say "$warn" "could not detect public IP"
+    fi
+
+    echo
+    if [[ $exit_code -eq 0 ]]; then
+        echo "verdict: local checks pass."
+        echo "         if external probes still fail, the block is one of:"
+        echo "           - cloud-provider security group / firewall above the VPS"
+        echo "           - upstream ISP / transit blocking"
+        echo "           - wrong PUBLIC_HOST"
+    else
+        echo "verdict: local issues found — fix them and re-run doctor"
+    fi
+    return $exit_code
 }
 
 cmd_rotate() {
@@ -409,6 +545,7 @@ case "$cmd" in
     export-client)  cmd_export_client "$@" ;;
     build-mobile)   cmd_build_clients "$@" ;;  # legacy alias
     build-clients)  cmd_build_clients "$@" ;;
+    doctor)         cmd_doctor "$@" ;;
     rotate)         cmd_rotate "$@" ;;
     ""|help|-h|--help) usage ;;
     *) die "unknown command: $cmd (try './deploy.sh help')" ;;
