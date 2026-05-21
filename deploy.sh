@@ -478,51 +478,200 @@ cmd_fetch_tun2socks() {
         rm -rf "$tmp"
     done
 
-    # Write the Windows launcher that chains sing-rdp-cli + tun2socks.
-    # Self-elevates because TUN/Wintun + routing require admin.
+    # Write the Windows launchers. The .bat self-elevates and invokes a
+    # PowerShell script that does the heavy lifting (route table edits,
+    # process supervision, cleanup) — far less painful than equivalent
+    # batch syntax.
     cat > ./dist/sing-rdp-vpn.bat <<'BATEOF'
 @echo off
-REM Full TUN-mode VPN launcher. Starts sing-rdp-cli (SOCKS5 listener) and
-REM tun2socks (TUN<->SOCKS5 bridge) together. Closing the window stops
-REM the VPN.
-
+REM Self-elevating shim that hands off to sing-rdp-vpn.ps1.
 setlocal
 cd /d "%~dp0"
 
-REM Self-elevate to administrator (TUN + routing both require it).
 net session >nul 2>&1
 if %errorlevel% neq 0 (
-    echo Requesting administrator rights...
     powershell -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
     exit /b
 )
 
-REM Sanity checks.
-for %%F in (sing-rdp-cli.exe tun2socks-windows-amd64.exe wintun.dll sing-rdp.json) do (
-    if not exist %%F (
-        echo missing %%F  -- copy it next to this script
-        pause
-        exit /b 1
-    )
-)
-
-REM Start the SOCKS5 listener in the background.
-echo Starting sing-rdp-cli (SOCKS5 on 127.0.0.1:1080)...
-start /b "" sing-rdp-cli.exe -c sing-rdp.json
-
-REM Give it ~2s to bind the socket before tun2socks dials it.
-timeout /t 2 /nobreak >nul
-
-REM Start tun2socks. -device wintun creates the TUN interface, -proxy
-REM is the SOCKS5 endpoint sing-rdp-cli is listening on.
-echo Starting tun2socks (TUN device + system route)...
-tun2socks-windows-amd64.exe -device wintun -proxy socks5://127.0.0.1:1080 -loglevel info
-
-REM tun2socks runs in the foreground; when it exits (Ctrl+C / close),
-REM tear down sing-rdp-cli too.
-echo Stopping sing-rdp-cli...
-taskkill /im sing-rdp-cli.exe /f >nul 2>&1
+powershell -ExecutionPolicy Bypass -NoProfile -File "%~dp0sing-rdp-vpn.ps1"
+echo.
+echo (VPN stopped -- press any key to close)
+pause >nul
 BATEOF
+
+    cat > ./dist/sing-rdp-vpn.ps1 <<'PSEOF'
+# sing-rdp-vpn.ps1 — system-wide VPN launcher
+#
+# Brings up the full TUN-mode VPN by:
+#   1. Resolving the VPS host from sing-rdp.json and pinning it to the
+#      ORIGINAL physical gateway (otherwise the RDP tunnel itself would
+#      try to traverse the Wintun adapter, causing a routing loop).
+#   2. Starting sing-rdp-cli (SOCKS5 endpoint with UDP relay).
+#   3. Starting tun2socks (Wintun adapter + TCP/UDP -> SOCKS5 bridge).
+#   4. Assigning an IP to the Wintun interface and adding a default
+#      route through it with a low metric.
+#   5. Tearing everything down cleanly on Ctrl+C / window close.
+
+$ErrorActionPreference = 'Stop'
+Set-Location -Path $PSScriptRoot
+
+$Required = @(
+    'sing-rdp-cli.exe',
+    'tun2socks-windows-amd64.exe',
+    'wintun.dll',
+    'sing-rdp.json'
+)
+foreach ($f in $Required) {
+    if (-not (Test-Path $f)) {
+        Write-Host "missing: $f -- copy it next to this script" -ForegroundColor Red
+        return
+    }
+}
+
+# --- Resolve VPS endpoint ------------------------------------------------
+$cfg = Get-Content sing-rdp.json -Raw | ConvertFrom-Json
+$vpsHostPort = $cfg.server
+$vpsHost = $vpsHostPort.Split(':')[0]
+try {
+    $vpsIP = ([System.Net.Dns]::GetHostAddresses($vpsHost) |
+        Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+        Select-Object -First 1).IPAddressToString
+} catch {
+    Write-Host "Failed to resolve VPS host '$vpsHost': $_" -ForegroundColor Red
+    return
+}
+Write-Host "VPS = $vpsHost ($vpsIP)"
+
+# --- Capture current default route ---------------------------------------
+$origRoute = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+    Sort-Object -Property RouteMetric |
+    Select-Object -First 1
+if (-not $origRoute) {
+    Write-Host "No existing default route -- can't pin VPS exception" -ForegroundColor Red
+    return
+}
+$origGw = $origRoute.NextHop
+$origIfIndex = $origRoute.InterfaceIndex
+Write-Host "Original gateway = $origGw (interface index $origIfIndex)"
+
+# --- TUN constants -------------------------------------------------------
+$TunAlias  = 'wintun'   # matches `-device wintun` below
+$TunIP     = '198.18.0.1'
+$TunPrefix = 15         # /15 covers the standard tun2socks fake subnet
+
+# --- Cleanup that runs on every exit path --------------------------------
+$cleanup = {
+    Write-Host ''
+    Write-Host 'Cleaning up...'
+    # Kill child processes first so they don't fight us deleting routes.
+    Get-Process tun2socks-windows-amd64 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Get-Process sing-rdp-cli -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+
+    # Drop our default route (if present).
+    Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+        Where-Object { $_.InterfaceAlias -eq $TunAlias } |
+        ForEach-Object {
+            Remove-NetRoute -InputObject $_ -Confirm:$false -ErrorAction SilentlyContinue
+        }
+
+    # Drop the host-route exception for the VPS.
+    Get-NetRoute -DestinationPrefix "$vpsIP/32" -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            Remove-NetRoute -InputObject $_ -Confirm:$false -ErrorAction SilentlyContinue
+        }
+
+    Write-Host 'Done.'
+}
+Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action $cleanup | Out-Null
+[Console]::TreatControlCAsInput = $false  # let Ctrl+C trigger the finally
+
+try {
+    # --- 1. Pin VPS to the original gateway --------------------------
+    Write-Host "Adding host route $vpsIP/32 via $origGw..."
+    try {
+        New-NetRoute -DestinationPrefix "$vpsIP/32" `
+                     -InterfaceIndex $origIfIndex `
+                     -NextHop $origGw `
+                     -RouteMetric 1 -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Host "(host route may already exist: $($_.Exception.Message)) -- continuing"
+    }
+
+    # --- 2. Start sing-rdp-cli ---------------------------------------
+    Write-Host 'Starting sing-rdp-cli...'
+    $cliProc = Start-Process -FilePath '.\sing-rdp-cli.exe' `
+                             -ArgumentList '-c', 'sing-rdp.json' `
+                             -PassThru -NoNewWindow `
+                             -RedirectStandardOutput 'sing-rdp-cli.log' `
+                             -RedirectStandardError 'sing-rdp-cli.err'
+    Start-Sleep -Seconds 2
+    if ($cliProc.HasExited) {
+        Write-Host 'sing-rdp-cli exited immediately -- check sing-rdp-cli.err' -ForegroundColor Red
+        return
+    }
+
+    # --- 3. Start tun2socks ------------------------------------------
+    Write-Host 'Starting tun2socks (creates Wintun adapter)...'
+    $tunProc = Start-Process -FilePath '.\tun2socks-windows-amd64.exe' `
+                             -ArgumentList '-device', $TunAlias,
+                                           '-proxy', 'socks5://127.0.0.1:1080',
+                                           '-loglevel', 'info' `
+                             -PassThru -NoNewWindow `
+                             -RedirectStandardOutput 'tun2socks.log' `
+                             -RedirectStandardError 'tun2socks.err'
+
+    # Wintun takes ~2s to come up. Wait until the interface is visible.
+    $deadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline) {
+        if (Get-NetAdapter -Name $TunAlias -ErrorAction SilentlyContinue) { break }
+        Start-Sleep -Milliseconds 200
+    }
+    if (-not (Get-NetAdapter -Name $TunAlias -ErrorAction SilentlyContinue)) {
+        Write-Host "Wintun adapter '$TunAlias' didn't appear -- check tun2socks.err" -ForegroundColor Red
+        return
+    }
+
+    # --- 4. Assign IP to Wintun + add default route ------------------
+    Write-Host "Configuring $TunAlias ($TunIP/$TunPrefix)..."
+    # Remove any stale IP first (idempotent restart).
+    Get-NetIPAddress -InterfaceAlias $TunAlias -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+    New-NetIPAddress -InterfaceAlias $TunAlias `
+                     -IPAddress $TunIP `
+                     -PrefixLength $TunPrefix `
+                     -ErrorAction Stop | Out-Null
+
+    Write-Host "Adding default route 0.0.0.0/0 via $TunAlias (metric 5)..."
+    New-NetRoute -DestinationPrefix '0.0.0.0/0' `
+                 -InterfaceAlias $TunAlias `
+                 -NextHop $TunIP `
+                 -RouteMetric 5 -ErrorAction Stop | Out-Null
+
+    Write-Host ''
+    Write-Host '============================================================' -ForegroundColor Green
+    Write-Host '  VPN is UP. All traffic now routes through ' -NoNewline; Write-Host $vpsHost -ForegroundColor Cyan
+    Write-Host '  Press Ctrl+C in this window to stop.'
+    Write-Host '============================================================' -ForegroundColor Green
+    Write-Host ''
+
+    # --- 5. Supervise -------------------------------------------------
+    while ($true) {
+        Start-Sleep -Seconds 1
+        if ($cliProc.HasExited) {
+            Write-Host 'sing-rdp-cli exited -- shutting down' -ForegroundColor Yellow
+            break
+        }
+        if ($tunProc.HasExited) {
+            Write-Host 'tun2socks exited -- shutting down' -ForegroundColor Yellow
+            break
+        }
+    }
+} finally {
+    & $cleanup
+}
+PSEOF
 
     echo
     echo "fetched:"
