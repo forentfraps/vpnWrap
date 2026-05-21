@@ -164,13 +164,11 @@ type rdpDialer struct {
 }
 
 // dialUDP is the UDP analogue of Dial. It opens a VLESS connection in
-// UDP-mode (cmd=2), which the server interprets as a multiplexed
-// packetaddr-framed UDP carrier — multiple destinations per stream.
-//
-// primaryHost / primaryPort go into the VLESS request as the initial
-// destination. sing-box requires *some* address there for inbound
-// routing, even though packetaddr lets us switch per-packet afterward.
-func (d *rdpDialer) dialUDP(ctx context.Context, primaryHost string, primaryPort uint16) (net.Conn, error) {
+// UDP-mode (cmd=2) addressed to the packetaddr magic FQDN, which
+// triggers sing-box's packetaddr-multiplexing path on the server. After
+// that, every datagram on the stream carries its own destination via
+// packetaddr framing, so one VLESS conn can fan out to many remotes.
+func (d *rdpDialer) dialUDP(ctx context.Context) (net.Conn, error) {
 	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -193,7 +191,7 @@ func (d *rdpDialer) dialUDP(ctx context.Context, primaryHost string, primaryPort
 	if err != nil {
 		return nil, fmt.Errorf("rdp: %w", err)
 	}
-	if err := writeVLESSRequestUDP(conn, d.uuid, primaryHost, primaryPort); err != nil {
+	if err := writeVLESSRequestUDP(conn, d.uuid); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("vless udp request: %w", err)
 	}

@@ -36,6 +36,17 @@ const (
 	vlessAddrIPv4   = 1
 	vlessAddrDomain = 2
 	vlessAddrIPv6   = 3
+
+	// packetAddrMagicFQDN is the sentinel destination sing-box's VLESS
+	// inbound looks for to opt the UDP connection into packetaddr
+	// multiplexing — see sing-vmess/packetaddr.SeqPacketMagicAddress.
+	// Without it, the server treats the VLESS-request destination as the
+	// one and only UDP target and forwards every payload verbatim. Our
+	// per-packet addr+port prefix then gets sent as garbage to that
+	// target, and responses come back as raw UDP bytes which our
+	// packetaddr parser misreads as fake source addresses (which is what
+	// tun2socks rejects with "symmetric NAT").
+	packetAddrMagicFQDN = "sp.packet-addr.v2fly.arpa"
 )
 
 // writeVLESSRequest writes a VLESS CONNECT request for the given destination
@@ -46,16 +57,15 @@ func writeVLESSRequest(w io.Writer, uuid [16]byte, dstHost string, dstPort uint1
 	return writeVLESSRequestCmd(w, uuid, vlessCmdTCP, dstHost, dstPort)
 }
 
-// writeVLESSRequestUDP opens a VLESS UDP-mode connection. With server-side
-// packet_encoding=packetaddr, the connection becomes a multiplexed UDP
-// pipe where each packetaddr frame carries a destination + payload.
-//
-// The dstHost/dstPort in the initial VLESS request is the "primary"
-// destination — packetaddr can switch destinations per packet, but sing-box
-// still requires *some* address here for routing decisions. We pass a
-// placeholder; the real per-packet destinations come from packetaddr.
-func writeVLESSRequestUDP(w io.Writer, uuid [16]byte, primaryHost string, primaryPort uint16) error {
-	return writeVLESSRequestCmd(w, uuid, vlessCmdUDP, primaryHost, primaryPort)
+// writeVLESSRequestUDP opens a VLESS UDP-mode connection in packetaddr
+// multiplexing mode. The destination MUST be the magic FQDN
+// "sp.packet-addr.v2fly.arpa" — sing-box's VLESS inbound checks for
+// exactly that string and only then wraps the conn with packetaddr.
+// Anything else (including a real "primary" IP) puts the server into
+// single-destination mode where it forwards each payload to that one
+// address as raw UDP bytes — incompatible with our packetaddr framing.
+func writeVLESSRequestUDP(w io.Writer, uuid [16]byte) error {
+	return writeVLESSRequestCmd(w, uuid, vlessCmdUDP, packetAddrMagicFQDN, 0)
 }
 
 func writeVLESSRequestCmd(w io.Writer, uuid [16]byte, cmd byte, dstHost string, dstPort uint16) error {

@@ -140,12 +140,13 @@ func (r *udpRelay) getOrCreateSession(src *net.UDPAddr, dstHost string, dstPort 
 	}
 	r.mu.Unlock()
 
-	// Open a fresh VLESS UDP-mode connection. The initial dst is the
-	// caller's first destination — packetaddr can switch dst per packet
-	// after that, but sing-box still expects something here.
+	// Open a fresh VLESS UDP connection in packetaddr-mux mode. The
+	// per-packet destination is carried inside packetaddr framing; the
+	// VLESS request itself just signals the mode via a magic FQDN.
+	_, _ = dstHost, dstPort
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	conn, err := r.dialer.dialUDP(ctx, dstHost, dstPort)
+	conn, err := r.dialer.dialUDP(ctx)
 	if err != nil {
 		return nil, false, err
 	}

@@ -28,9 +28,15 @@ import (
 // matches `packet_encoding` on the server.
 
 const (
+	// Atyp values come from sing-vmess/packetaddr.AddressSerializer:
+	//   0x01 = IPv4, 0x02 = IPv6. There is NO domain atyp — sing-vmess
+	// packetaddr explicitly rejects FQDN destinations (see
+	// packetaddr.ErrFqdnUnsupported). We keep paAtypDomain defined for
+	// our own internal use, but emitting a domain frame will be rejected
+	// by the server.
 	paAtypIPv4   = 0x01
+	paAtypIPv6   = 0x02
 	paAtypDomain = 0x03
-	paAtypIPv6   = 0x04
 
 	// 65535 - (1 atyp + 256 domain + 2 port) headroom; in practice
 	// fragmentation kicks in well before we hit this.
