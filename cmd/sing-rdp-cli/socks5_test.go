@@ -146,6 +146,67 @@ func TestSOCKS5ConnectDomain(t *testing.T) {
 	}
 }
 
+// stubUDPRelay reports a fixed bind addr. We don't need a working datagram
+// relay for the SOCKS5 control-plane test.
+type stubUDPRelay struct {
+	host string
+	port uint16
+}
+
+func (s *stubUDPRelay) BindAddr() (string, uint16) { return s.host, s.port }
+
+// TestSOCKS5UDPAssociateHandshake regresses a bug where handleUDPAssociate
+// re-read the ATYP byte that the request-header parse had already
+// consumed. The mis-aligned read made discardSOCKSAddr fail and the
+// client got a hangup with no reply, which tun2socks reports as the
+// generic "command not supported" error.
+func TestSOCKS5UDPAssociateHandshake(t *testing.T) {
+	udp := &stubUDPRelay{host: "127.0.0.1", port: 54321}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() { _ = ServeSOCKS5(ln, &fakeDialer{}, udp, func(string, ...any) {}) }()
+
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+
+	// SOCKS5 greeting (NoAuth)
+	c.Write([]byte{5, 1, 0})
+	if _, err := io.ReadFull(c, make([]byte, 2)); err != nil {
+		t.Fatal(err)
+	}
+
+	// UDP ASSOCIATE: ver=5, cmd=3, rsv=0, atyp=ipv4, 0.0.0.0, port=0
+	c.Write([]byte{5, 3, 0, 1, 0, 0, 0, 0, 0, 0})
+
+	// Expected reply: ver=5, rep=0 (success), rsv=0, atyp=ipv4,
+	//                  127.0.0.1, port=54321 (BE)
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(c, reply); err != nil {
+		t.Fatalf("read reply: %v", err)
+	}
+	if reply[1] != socksRepSuccess {
+		t.Fatalf("rep=%d (want 0 success); got reply %v", reply[1], reply)
+	}
+	if reply[3] != socksAddrIPv4 {
+		t.Errorf("atyp=%d want %d (ipv4)", reply[3], socksAddrIPv4)
+	}
+	if !bytes.Equal(reply[4:8], []byte{127, 0, 0, 1}) {
+		t.Errorf("bind addr: %v", reply[4:8])
+	}
+	port := uint16(reply[8])<<8 | uint16(reply[9])
+	if port != 54321 {
+		t.Errorf("bind port: got %d want 54321", port)
+	}
+}
+
 func TestSOCKS5RejectsNonV5(t *testing.T) {
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
 	defer ln.Close()

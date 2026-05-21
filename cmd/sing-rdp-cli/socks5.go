@@ -124,7 +124,10 @@ func handleSOCKS5(c net.Conn, dial Dialer, udp UDPRelay) error {
 			writeReply(c, socksRepCmdNotSupported)
 			return errors.New("UDP ASSOCIATE requested but no UDP relay configured")
 		}
-		return handleUDPAssociate(c, udp)
+		// hdr[3] was already consumed as ATYP — pass it through so the
+		// UDP handler doesn't re-read (which would treat the addr's
+		// first byte as the atyp and bail).
+		return handleUDPAssociate(c, hdr[3], udp)
 	default:
 		writeReply(c, socksRepCmdNotSupported)
 		return fmt.Errorf("unsupported cmd: %d", hdr[1])
@@ -213,14 +216,13 @@ func writeReply(c net.Conn, rep byte) error {
 //     ASSOCIATE ends.
 //
 // The actual datagram relay (listening on the UDP socket and bridging to
-// VLESS) lives in the udp.go relay; this handler just glues the SOCKS5
-// control plane to it.
-func handleUDPAssociate(c net.Conn, udp UDPRelay) error {
-	// Consume DST.ADDR + DST.PORT from the request and discard.
-	atyp, err := readByte(c)
-	if err != nil {
-		return fmt.Errorf("udp assoc: read atyp: %w", err)
-	}
+// VLESS) lives in udp.go; this handler just glues the SOCKS5 control
+// plane to it.
+//
+// atyp comes from the request header (hdr[3]) — the caller already
+// consumed those 4 bytes, so we MUST NOT read atyp from the wire here
+// or we'll treat the addr's first byte as atyp.
+func handleUDPAssociate(c net.Conn, atyp byte, udp UDPRelay) error {
 	if err := discardSOCKSAddr(c, atyp); err != nil {
 		return fmt.Errorf("udp assoc: discard addr: %w", err)
 	}
