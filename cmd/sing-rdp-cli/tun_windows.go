@@ -39,6 +39,8 @@ const (
 	tunAddress    = "198.18.0.1"
 	tunPrefix     = 15      // matches the standard tun2socks fake subnet
 	tunDefaultMet = 5
+	tunIfaceMet   = 1       // Wintun's interface metric — must be low so
+	                        // its default-route candidate wins over physical NICs
 	tunHostMet    = 1
 	tun2socksExe  = "tun2socks-windows-amd64.exe"
 )
@@ -134,7 +136,7 @@ func runTUN(ctx context.Context, cfg *Config) error {
 		return err
 	}
 
-	// --- 4. Configure Wintun (IP + default route) ---------------------
+	// --- 4. Configure Wintun (IP + interface metric + default route) ---
 	log.Printf("[tun] configuring %s: %s/%d", tunAlias, tunAddress, tunPrefix)
 	if err := setInterfaceIP(tunAlias, tunAddress, prefixToNetmask(tunPrefix)); err != nil {
 		return fmt.Errorf("set %s ip: %w", tunAlias, err)
@@ -146,6 +148,22 @@ func runTUN(ctx context.Context, cfg *Config) error {
 		return nil
 	})
 
+	// CRITICAL: lower Wintun's interface metric so the OS actually
+	// PREFERS the default route we're about to install. Windows
+	// computes effective route metric as `route metric + interface
+	// metric`. Wintun defaults to a high interface metric (~25) on a
+	// fresh adapter; if we don't override it, our default route on
+	// Wintun "loses" against the physical interface and traffic stays
+	// on Ethernet.
+	//
+	// Setting the interface metric to 1 ensures any default route on
+	// Wintun has effective metric of (1 + route metric). With route
+	// metric=5, that's 6 — well below Ethernet's typical 25+.
+	log.Printf("[tun] lowering %s interface metric to %d (so the OS picks it)", tunAlias, tunIfaceMet)
+	if err := setInterfaceMetric(tunAlias, tunIfaceMet); err != nil {
+		return fmt.Errorf("set %s interface metric: %w", tunAlias, err)
+	}
+
 	log.Printf("[tun] installing default route via %s (metric %d)", tunAlias, tunDefaultMet)
 	if err := addDefaultRoute(tunAddress, tunDefaultMet); err != nil {
 		return fmt.Errorf("install default route: %w", err)
@@ -154,6 +172,19 @@ func runTUN(ctx context.Context, cfg *Config) error {
 		log.Printf("[tun] removing default route via %s", tunAddress)
 		return removeDefaultRoute(tunAddress)
 	})
+
+	// --- 4b. Diagnostic: dump the chosen default route -----------------
+	// Tells the user *and* future-me-debugging which route the OS
+	// actually picked, so we don't have to guess from inside out.
+	if chosen, err := chosenDefaultRoute(); err == nil {
+		log.Printf("[tun] OS default route is now: %s", chosen)
+		if !strings.Contains(chosen, tunAddress) {
+			log.Printf("[tun] WARNING: default route is NOT our Wintun gateway (%s). " +
+				"Traffic may still leak through the physical interface — check " +
+				"interface metrics with `Get-NetIPInterface | Where InterfaceAlias -eq wintun`",
+				tunAddress)
+		}
+	}
 
 	fmt.Println()
 	fmt.Println("============================================================")
@@ -255,6 +286,49 @@ func removeDefaultRoute(via string) error {
 func setInterfaceIP(alias, ip, mask string) error {
 	return runQuiet("netsh", "interface", "ipv4", "set", "address",
 		"name="+alias, "static", ip, mask)
+}
+
+// setInterfaceMetric overrides the OS-chosen interface metric on the
+// given adapter. We use this to force Wintun's effective default-route
+// metric below the physical NIC's, otherwise Windows ignores our default
+// route entirely.
+func setInterfaceMetric(alias string, metric int) error {
+	return runQuiet("netsh", "interface", "ipv4", "set", "interface",
+		alias, fmt.Sprintf("metric=%d", metric))
+}
+
+// chosenDefaultRoute returns a short string describing the default route
+// the OS is *currently* using (the lowest-effective-metric 0.0.0.0/0
+// entry). Used as a post-install diagnostic — if our installation
+// didn't actually become THE default route, we want to say so loudly
+// instead of pretending the VPN is up.
+//
+// Format: "gateway=X.X.X.X iface=Y.Y.Y.Y metric=N"
+func chosenDefaultRoute() (string, error) {
+	out, err := exec.Command("route", "print", "-4", "0.0.0.0").Output()
+	if err != nil {
+		return "", err
+	}
+	var best []string
+	bestMet := 1 << 30
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 5 || fields[0] != "0.0.0.0" || fields[1] != "0.0.0.0" {
+			continue
+		}
+		var met int
+		if _, err := fmt.Sscanf(fields[4], "%d", &met); err != nil {
+			continue
+		}
+		if met < bestMet {
+			bestMet = met
+			best = fields
+		}
+	}
+	if best == nil {
+		return "", errors.New("no default route in table")
+	}
+	return fmt.Sprintf("gateway=%s iface=%s metric=%d", best[2], best[3], bestMet), nil
 }
 
 // runQuiet executes name+args, capturing output only when the command fails
