@@ -20,9 +20,9 @@ test-cross:
 		os=$$(echo $$t | cut -d/ -f1); arch=$$(echo $$t | cut -d/ -f2); arm=$$(echo $$t | cut -d/ -f3); \
 		echo "==> $$os/$$arch$${arm:+/v$$arm}"; \
 		GOOS=$$os GOARCH=$$arch GOARM=$$arm CGO_ENABLED=0 \
-			go build -o /dev/null ./cmd/sing-rdp-client ./cmd/sing-rdp-cli ./rdp/... ./health/... ./shape/... || exit 1; \
+			go vet ./cmd/sing-rdp-client ./cmd/sing-rdp-cli ./rdp/... ./health/... ./shape/... || exit 1; \
 	done
-	@echo "all platforms build cleanly"
+	@echo "all platforms vet cleanly"
 
 # Build the runtime image.
 docker:

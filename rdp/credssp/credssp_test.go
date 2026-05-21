@@ -44,7 +44,10 @@ func TestTSRequestErrorCode(t *testing.T) {
 		t.Fatal(err)
 	}
 	if out.ErrorCode != StatusLogonFailure {
-		t.Errorf("errorCode: got 0x%x want 0x%x", out.ErrorCode, StatusLogonFailure)
+		// Cast the untyped const so it doesn't default to `int` when boxed
+		// into Errorf's interface{} args — that overflows on 32-bit GOARCHes
+		// (linux/arm, linux/386). int64 matches ErrorCode's field type.
+		t.Errorf("errorCode: got 0x%x want 0x%x", out.ErrorCode, int64(StatusLogonFailure))
 	}
 }
 
@@ -145,7 +148,9 @@ func TestServerRejects(t *testing.T) {
 		t.Fatalf("expected AuthError, got %v", err)
 	}
 	if authErr.NTStatus != StatusLogonFailure {
-		t.Errorf("got 0x%x want 0x%x", authErr.NTStatus, StatusLogonFailure)
+		// uint32 cast matches NTStatus's field type and avoids the
+		// untyped-const-defaulting-to-int overflow on 32-bit platforms.
+		t.Errorf("got 0x%x want 0x%x", authErr.NTStatus, uint32(StatusLogonFailure))
 	}
 }
 
