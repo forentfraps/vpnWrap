@@ -137,35 +137,50 @@ func runTUN(ctx context.Context, cfg *Config) error {
 	}
 
 	// --- 4. Configure Wintun (IP + interface metric + default route) ---
-	log.Printf("[tun] configuring %s: %s/%d", tunAlias, tunAddress, tunPrefix)
-	if err := setInterfaceIP(tunAlias, tunAddress, prefixToNetmask(tunPrefix)); err != nil {
-		return fmt.Errorf("set %s ip: %w", tunAlias, err)
+	tunIface, err := net.InterfaceByName(tunAlias)
+	if err != nil {
+		return fmt.Errorf("look up %s interface index: %w", tunAlias, err)
+	}
+	tunIfIndex := tunIface.Index
+	log.Printf("[tun] %s is interface index %d", tunAlias, tunIfIndex)
+
+	// `netsh ... set address` is a no-op on a freshly-created Wintun
+	// adapter (it has no IPv4 config to "set"). Use `add address`
+	// which works regardless of starting state.
+	log.Printf("[tun] adding IP %s/%d to %s", tunAddress, tunPrefix, tunAlias)
+	if err := addInterfaceIP(tunAlias, tunAddress, prefixToNetmask(tunPrefix)); err != nil {
+		return fmt.Errorf("add %s ip: %w", tunAlias, err)
 	}
 	cleanup.Add(func() error {
-		// netsh has no "remove ip" — the adapter goes away when
-		// tun2socks dies, taking the IP with it. No-op here, kept
-		// for symmetry.
-		return nil
+		// The adapter goes away when tun2socks dies, taking the IP
+		// with it. Best-effort delete in case we're re-launched and
+		// the IP is somehow sticky.
+		return runQuiet("netsh", "interface", "ipv4", "delete", "address",
+			"name="+tunAlias, "address="+tunAddress)
 	})
 
-	// CRITICAL: lower Wintun's interface metric so the OS actually
-	// PREFERS the default route we're about to install. Windows
-	// computes effective route metric as `route metric + interface
-	// metric`. Wintun defaults to a high interface metric (~25) on a
-	// fresh adapter; if we don't override it, our default route on
-	// Wintun "loses" against the physical interface and traffic stays
-	// on Ethernet.
-	//
-	// Setting the interface metric to 1 ensures any default route on
-	// Wintun has effective metric of (1 + route metric). With route
-	// metric=5, that's 6 — well below Ethernet's typical 25+.
-	log.Printf("[tun] lowering %s interface metric to %d (so the OS picks it)", tunAlias, tunIfaceMet)
+	// Force Wintun's interface metric low so its default route wins
+	// against the physical NIC's. Setting this disables
+	// AutomaticMetric (confirmed by user's Get-NetIPInterface output:
+	// "AutomaticMetric: Disabled, InterfaceMetric: 1").
+	log.Printf("[tun] lowering %s interface metric to %d", tunAlias, tunIfaceMet)
 	if err := setInterfaceMetric(tunAlias, tunIfaceMet); err != nil {
 		return fmt.Errorf("set %s interface metric: %w", tunAlias, err)
 	}
 
-	log.Printf("[tun] installing default route via %s (metric %d)", tunAlias, tunDefaultMet)
-	if err := addDefaultRoute(tunAddress, tunDefaultMet); err != nil {
+	// `route add` without `IF <index>` lets Windows infer the
+	// interface from the next-hop. If the next-hop isn't directly
+	// reachable on any adapter (which happens when bug #1 above bit
+	// us, but also as a transient during startup), Windows binds the
+	// route to the WRONG interface — typically Ethernet. The route
+	// then takes Ethernet's interface metric, which buries it below
+	// the physical default route.
+	//
+	// Pinning the route to Wintun's interface index makes the route
+	// inherit Wintun's interface metric (1), giving an effective
+	// metric of 1+5=6 vs Ethernet's 0+50=50. Ours wins.
+	log.Printf("[tun] installing default route via %s (metric %d, if %d)", tunAddress, tunDefaultMet, tunIfIndex)
+	if err := addDefaultRouteOnIface(tunAddress, tunDefaultMet, tunIfIndex); err != nil {
 		return fmt.Errorf("install default route: %w", err)
 	}
 	cleanup.Add(func() error {
@@ -272,20 +287,29 @@ func removeHostRoute(dst string) error {
 	return runQuiet("route", "delete", dst, "mask", "255.255.255.255")
 }
 
-func addDefaultRoute(via string, metric int) error {
-	return runQuiet("route", "add", "0.0.0.0", "mask", "0.0.0.0",
-		via, "metric", fmt.Sprint(metric))
-}
-
 func removeDefaultRoute(via string) error {
 	// `route delete 0.0.0.0` would clobber the original default route
 	// too; specifying the gateway scopes the delete to ours.
 	return runQuiet("route", "delete", "0.0.0.0", "mask", "0.0.0.0", via)
 }
 
-func setInterfaceIP(alias, ip, mask string) error {
-	return runQuiet("netsh", "interface", "ipv4", "set", "address",
-		"name="+alias, "static", ip, mask)
+// addInterfaceIP assigns an IPv4 address to the given adapter using
+// `netsh ... add address`. This is the correct verb for a freshly
+// created adapter that has no existing IPv4 config — `set address`
+// silently no-ops in that state because there's nothing to "set".
+func addInterfaceIP(alias, ip, mask string) error {
+	return runQuiet("netsh", "interface", "ipv4", "add", "address",
+		"name="+alias, "address="+ip, "mask="+mask)
+}
+
+// addDefaultRouteOnIface adds 0.0.0.0/0 explicitly bound to a specific
+// interface index. Without `IF <index>`, Windows picks an interface
+// based on next-hop reachability, which can end up wrong during the
+// brief window when Wintun's IP isn't fully propagated yet (and stays
+// wrong even after).
+func addDefaultRouteOnIface(via string, metric, ifIndex int) error {
+	return runQuiet("route", "add", "0.0.0.0", "mask", "0.0.0.0",
+		via, "metric", fmt.Sprint(metric), "IF", fmt.Sprint(ifIndex))
 }
 
 // setInterfaceMetric overrides the OS-chosen interface metric on the
