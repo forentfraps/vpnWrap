@@ -1,0 +1,9 @@
+# Keep the build context small. Everything except sources and docker/ is junk.
+.git
+.gitignore
+.idea
+.vscode
+*.md
+docs/
+examples/
+certs/

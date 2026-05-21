@@ -1,0 +1,35 @@
+{
+  "log": { "level": "info" },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "rdp-in",
+      "listen": "::",
+      "listen_port": 3389,
+      "users": [
+        { "uuid": "REPLACE-WITH-UUID", "name": "user1" }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "vps.example.com",
+        "certificate_path": "/etc/sing-box/fullchain.pem",
+        "key_path": "/etc/sing-box/privkey.pem"
+      },
+      "transport": {
+        "type": "rdp",
+        "mode": "standalone",
+        "heartbeat_interval": 5,
+        "shape": {
+          "target_down_ratio": 0.85,
+          "chaff_interval_ms": 200
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" }
+  ],
+  "route": {
+    "rules": [ { "inbound": "rdp-in", "outbound": "direct" } ]
+  }
+}

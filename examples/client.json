@@ -1,0 +1,42 @@
+{
+  "log": { "level": "info" },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "in",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "rdp-out",
+      "server": "vps.example.com",
+      "server_port": 3389,
+      "uuid": "REPLACE-WITH-UUID",
+      "flow": "",
+      "tls": {
+        "enabled": true,
+        "server_name": "vps.example.com",
+        "insecure": false
+      },
+      "transport": {
+        "type": "rdp",
+        "mode": "standalone",
+        "cookie": "Administrator",
+        "fingerprint": "mstsc-win11",
+        "heartbeat_interval": 5,
+        "shape": {
+          "target_down_ratio": 0.85,
+          "max_client_burst": 8192,
+          "burst_window_ms": 50,
+          "chaff_interval_ms": 200
+        }
+      }
+    }
+  ],
+  "route": {
+    "rules": [ { "inbound": "in", "outbound": "rdp-out" } ]
+  }
+}

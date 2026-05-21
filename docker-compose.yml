@@ -1,0 +1,62 @@
+# docker-compose deployment of the sing-rdp server. Pairs with an existing
+# proxy server (sing-box / xray / shadowsocks) on the same host listening
+# on the loopback address that SING_RDP_UPSTREAM points at.
+#
+# Quickstart:
+#   1. Mount a real TLS cert at ./certs/{cert,key}.pem (or let the entrypoint
+#      generate a self-signed one for testing).
+#   2. Set SING_RDP_COOKIE to a corporate-looking username you'll use as the
+#      magic value on the client.
+#   3. Start your inner proxy (e.g. sing-box VLESS inbound) on 127.0.0.1:1080
+#      via host networking, OR adjust SING_RDP_UPSTREAM to point at a sibling
+#      container.
+#   4. `docker compose up -d`
+#
+# Health: `docker compose ps` shows healthy/unhealthy per the HEALTHCHECK.
+
+services:
+  sing-rdp:
+    build:
+      context: .
+      target: runtime
+    image: sing-rdp:latest
+    container_name: sing-rdp
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      SING_RDP_COOKIE: "${SING_RDP_COOKIE:-svc-jumpbox}"
+      SING_RDP_UPSTREAM: "${SING_RDP_UPSTREAM:-127.0.0.1:1080}"
+      SING_RDP_LISTEN: ":3389"
+      SING_RDP_HOSTNAME: "${SING_RDP_HOSTNAME:-DESKTOP-UNKNOWN}"
+      SING_RDP_SNI: "${SING_RDP_SNI:-${SING_RDP_HOSTNAME:-DESKTOP-UNKNOWN}}"
+      SING_RDP_NETBIOS_DOMAIN: "${SING_RDP_NETBIOS_DOMAIN:-WORKGROUP}"
+      SING_RDP_DNS_DOMAIN: "${SING_RDP_DNS_DOMAIN:-}"
+    env_file:
+      - path: ./.env
+        required: false
+    volumes:
+      - ./certs:/etc/sing-rdp:ro
+    # Healthcheck is defined inside the image; compose surfaces its result.
+
+  # An optional integration-test sidecar that runs the in-container
+  # `sing-rdp-probe` against the server every minute and exits non-zero if
+  # the handshake degrades. Useful in staging; remove in production.
+  sing-rdp-probe:
+    build:
+      context: .
+      target: runtime
+    image: sing-rdp:latest
+    container_name: sing-rdp-probe
+    restart: "no"
+    profiles: ["test"]
+    network_mode: host
+    entrypoint: ["/usr/local/bin/sing-rdp-probe"]
+    command:
+      - "-addr"
+      - "127.0.0.1:3389"
+      - "-cookie"
+      - "${SING_RDP_COOKIE:-svc-jumpbox}"
+      - "-insecure"
+    depends_on:
+      sing-rdp:
+        condition: service_healthy
