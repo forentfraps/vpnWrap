@@ -1,20 +1,32 @@
-# docker-compose deployment of the sing-rdp server. Pairs with an existing
-# proxy server (sing-box / xray / shadowsocks) on the same host listening
-# on the loopback address that SING_RDP_UPSTREAM points at.
+# docker-compose deployment of the full sing-rdp VPN stack:
+#
+#   [tunnel client] --RDP/TCP 3389--> sing-rdp -> 127.0.0.1:1080 (sing-box-inner)
+#                                                 -> direct outbound to the internet
 #
 # Quickstart:
-#   1. Mount a real TLS cert at ./certs/{cert,key}.pem (or let the entrypoint
-#      generate a self-signed one for testing).
-#   2. Set SING_RDP_COOKIE to a corporate-looking username you'll use as the
-#      magic value on the client.
-#   3. Start your inner proxy (e.g. sing-box VLESS inbound) on 127.0.0.1:1080
-#      via host networking, OR adjust SING_RDP_UPSTREAM to point at a sibling
-#      container.
-#   4. `docker compose up -d`
-#
-# Health: `docker compose ps` shows healthy/unhealthy per the HEALTHCHECK.
+#   1. ./deploy.sh init    (generates identity, UUID, cert, .env, singbox-server.json)
+#   2. ./deploy.sh up      (builds image, brings up both services)
+#   3. ./deploy.sh status  (verifies /healthz reports both green)
+#   4. ./deploy.sh client-config  (prints copy-paste config for your client)
 
 services:
+  # --- inner proxy ---------------------------------------------------------
+  # VLESS server bound to loopback. sing-rdp on the same host forwards
+  # tunnel traffic here; sing-box dials the actual destinations.
+  sing-box-inner:
+    image: ghcr.io/sagernet/sing-box:v1.10.7
+    container_name: sing-box-inner
+    restart: unless-stopped
+    network_mode: host
+    # The rendered config (with UUID substituted) is created by deploy.sh init.
+    # If missing, the container will fail to start — deploy.sh checks for it.
+    volumes:
+      - ./singbox-server.json:/etc/sing-box/config.json:ro
+    command: ["run", "-c", "/etc/sing-box/config.json"]
+    # Image is minimal (no curl / nc), so we let the outer sing-rdp /healthz
+    # do an upstream TCP probe and surface the combined state.
+
+  # --- transport wrapper ---------------------------------------------------
   sing-rdp:
     build:
       context: .
@@ -23,6 +35,8 @@ services:
     container_name: sing-rdp
     restart: unless-stopped
     network_mode: host
+    depends_on:
+      - sing-box-inner
     environment:
       SING_RDP_COOKIE: "${SING_RDP_COOKIE:-svc-jumpbox}"
       SING_RDP_UPSTREAM: "${SING_RDP_UPSTREAM:-127.0.0.1:1080}"
@@ -36,11 +50,11 @@ services:
         required: false
     volumes:
       - ./certs:/etc/sing-rdp:ro
-    # Healthcheck is defined inside the image; compose surfaces its result.
+    # HEALTHCHECK is baked into the image — see Dockerfile.
 
-  # An optional integration-test sidecar that runs the in-container
-  # `sing-rdp-probe` against the server every minute and exits non-zero if
-  # the handshake degrades. Useful in staging; remove in production.
+  # --- optional: probe sidecar -------------------------------------------
+  # Runs the in-image RDP probe against the live server, exits non-zero
+  # if the handshake degrades. Trigger with: ./deploy.sh probe
   sing-rdp-probe:
     build:
       context: .

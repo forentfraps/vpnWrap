@@ -1,15 +1,19 @@
 // Package health exposes an HTTP endpoint that reports the readiness of
-// the sing-rdp server. Two signals are combined:
+// the sing-rdp server. Three classes of signal are combined:
 //
-//  1. TCP liveness of the downstream xrdp service (so probes spliced to it
-//     will actually succeed).
-//  2. A loopback handshake against our own listener (so the full RDP +
-//     TLS stack is verified end to end, not just port liveness).
+//  1. TCP liveness of arbitrary named services (xrdp, the inner proxy
+//     upstream, etc.) — fast and side-effect-free.
+//  2. A loopback handshake against our own listener that runs the entire
+//     RDP+TLS+CredSSP stack end to end (so it catches handshake-layer
+//     regressions that pure port liveness wouldn't).
 //
-// /healthz returns 200 with a JSON body when both pass, 503 otherwise.
-// Bind the listener to loopback or a private interface — it intentionally
-// leaks the magic cookie validity (it would 503 if our handshake stopped
-// working) and shouldn't be reachable from the public internet.
+// /healthz returns 200 with a JSON body when every component is green,
+// 503 otherwise. /livez is a cheap subset — TCP checks only, no
+// loopback handshake — appropriate for orchestrator liveness probes
+// that should restart on hangs rather than transient handshake hiccups.
+//
+// Bind to loopback or a private interface only — it intentionally reveals
+// whether your handshake works (and therefore implies cookie validity).
 package health
 
 import (
@@ -18,18 +22,27 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sort"
 	"sync/atomic"
 	"time"
 )
+
+// TCPCheck is a single labeled TCP probe.
+type TCPCheck struct {
+	// Name appears in the JSON output (e.g. "xrdp", "upstream").
+	Name string
+	// Addr is the host:port to dial.
+	Addr string
+}
 
 // Config holds the wiring for the health endpoint.
 type Config struct {
 	// ListenAddr is the HTTP bind address (e.g. 127.0.0.1:9180).
 	ListenAddr string
 
-	// TCPCheck is a host:port that must accept a TCP connection within
-	// CheckTimeout. Typically xrdp's address.
-	TCPCheck string
+	// TCPChecks are dialed in parallel on every /healthz hit. An empty
+	// list is allowed.
+	TCPChecks []TCPCheck
 
 	// LoopProbe runs a full client-side RDP handshake against our own
 	// listener. Returns nil on success.
@@ -80,25 +93,54 @@ func (c *Checker) Close() error { return c.server.Close() }
 // LastOK reports the most recent /healthz result (initially false).
 func (c *Checker) LastOK() bool { return c.lastOK.Load() }
 
+// report is the JSON shape /healthz returns. Components is keyed by check
+// name so callers (and ops dashboards) can see exactly which probe failed
+// without grepping a free-form message.
 type report struct {
-	OK        bool   `json:"ok"`
-	XRDP      string `json:"xrdp"`
-	Loopback  string `json:"loopback"`
-	CheckedAt string `json:"checked_at"`
+	OK         bool              `json:"ok"`
+	Components map[string]string `json:"components"`
+	CheckedAt  string            `json:"checked_at"`
 }
 
 func (c *Checker) handleHealth(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), c.cfg.CheckTimeout*2)
 	defer cancel()
 
-	xerr := c.checkTCP(ctx, c.cfg.TCPCheck)
-	lerr := c.checkLoop(ctx)
+	results := make(map[string]string, len(c.cfg.TCPChecks)+1)
+	allOK := true
+
+	// Run TCP checks in parallel; aggregate by name.
+	type tcpResult struct {
+		name string
+		err  error
+	}
+	resultsCh := make(chan tcpResult, len(c.cfg.TCPChecks))
+	for _, chk := range c.cfg.TCPChecks {
+		chk := chk
+		go func() {
+			resultsCh <- tcpResult{name: chk.Name, err: c.checkTCP(ctx, chk.Addr)}
+		}()
+	}
+	for range c.cfg.TCPChecks {
+		r := <-resultsCh
+		results[r.name] = stringErr(r.err, "ok")
+		if r.err != nil {
+			allOK = false
+		}
+	}
+
+	// Loop probe last (it's the expensive one).
+	if lerr := c.checkLoop(ctx); lerr != nil {
+		results["loopback"] = lerr.Error()
+		allOK = false
+	} else if c.cfg.LoopProbe != nil {
+		results["loopback"] = "ok"
+	}
 
 	rep := report{
-		OK:        xerr == nil && lerr == nil,
-		XRDP:      stringErr(xerr, "ok"),
-		Loopback:  stringErr(lerr, "ok"),
-		CheckedAt: time.Now().UTC().Format(time.RFC3339),
+		OK:         allOK,
+		Components: results,
+		CheckedAt:  time.Now().UTC().Format(time.RFC3339),
 	}
 	c.lastOK.Store(rep.OK)
 
@@ -109,15 +151,21 @@ func (c *Checker) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(rep)
 }
 
-// /livez is a cheaper check: TCP probe only, no in-process handshake.
-// Useful for orchestrator liveness probes that should restart on hangs
-// rather than transient handshake failures.
+// /livez is a cheaper check: TCP probes only, no in-process handshake.
+// Returns 200 only if every configured TCP check passes.
 func (c *Checker) handleLive(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), c.cfg.CheckTimeout)
 	defer cancel()
-	if err := c.checkTCP(ctx, c.cfg.TCPCheck); err != nil {
-		http.Error(w, fmt.Sprintf("xrdp: %v", err), http.StatusServiceUnavailable)
-		return
+
+	// Sort by name so error output is stable across runs.
+	checks := append([]TCPCheck(nil), c.cfg.TCPChecks...)
+	sort.Slice(checks, func(i, j int) bool { return checks[i].Name < checks[j].Name })
+
+	for _, chk := range checks {
+		if err := c.checkTCP(ctx, chk.Addr); err != nil {
+			http.Error(w, fmt.Sprintf("%s: %v", chk.Name, err), http.StatusServiceUnavailable)
+			return
+		}
 	}
 	_, _ = fmt.Fprintln(w, "ok")
 }

@@ -24,9 +24,15 @@ if [[ ! -f "$CERT" || ! -f "$KEY" ]]; then
     echo "[entrypoint] no cert mounted; generating Windows-style self-signed"
     mkdir -p /etc/sing-rdp
     # Match Windows-built-in RDP cert: 180-day, sha256RSA, CN only, no SAN.
-    openssl req -x509 -newkey rsa:2048 -sha256 -days 180 -nodes \
+    # Keep stderr so a failing openssl reports its actual reason instead
+    # of leaving us with a half-generated key file and no diagnostic.
+    if ! openssl req -x509 -newkey rsa:2048 -sha256 -days 180 -nodes \
         -subj "/CN=${HOSTNAME_VAL}" \
-        -keyout "$KEY" -out "$CERT" >/dev/null 2>&1
+        -keyout "$KEY" -out "$CERT" >/dev/null
+    then
+        echo "[entrypoint] openssl req failed — cannot continue" >&2
+        exit 1
+    fi
 fi
 
 # xrdp needs /var/run/xrdp.

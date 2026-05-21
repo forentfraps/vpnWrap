@@ -86,7 +86,10 @@ func main() {
 		go func() {
 			hc := health.New(health.Config{
 				ListenAddr: *healthAddr,
-				TCPCheck:   *xrdpAddr,
+				TCPChecks: []health.TCPCheck{
+					{Name: "xrdp", Addr: *xrdpAddr},
+					{Name: "upstream", Addr: *upstream},
+				},
 				LoopProbe: func(ctx context.Context) error {
 					return srv.probeSelf(ctx, ln.Addr().String())
 				},

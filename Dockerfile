@@ -71,5 +71,8 @@ EXPOSE 3389
 # to xrdp and an in-process RDP handshake against ourselves.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD wget -qO- --tries=1 http://127.0.0.1:9180/healthz | grep -q '"ok":true' || exit 1
+# /healthz now reports every component (xrdp, upstream, loopback). The grep
+# above checks the aggregate flag; for component-level diagnostics from the
+# host:  curl http://127.0.0.1:9180/healthz | jq .
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
