@@ -48,14 +48,20 @@ func (c *fastPathConn) Read(p []byte) (int, error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 
-	if len(c.readBuf) == 0 {
+	// Loop on empty payloads (heartbeats / chaff frames). The earlier
+	// version of this code recursed via `return c.Read(p)` — that
+	// deadlocks the moment a heartbeat arrives, because we still hold
+	// readMu and sync.Mutex isn't reentrant. Symptom in production:
+	// every connection silently freezes ~5 seconds (one heartbeat
+	// interval) after the handshake, browser eventually times out
+	// ~11.6s later, server logs "CLOSED 0B/0B".
+	for len(c.readBuf) == 0 {
 		payload, err := ReadFastPath(c.br)
 		if err != nil {
 			return 0, err
 		}
 		if len(payload) == 0 {
-			// Heartbeat / chaff frame — recurse by looping.
-			return c.Read(p)
+			continue
 		}
 		c.readBuf = payload
 	}

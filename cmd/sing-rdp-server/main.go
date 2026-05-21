@@ -225,20 +225,30 @@ func (s *server) handle(raw net.Conn) {
 
 	logf("conn from %s: tunnel ESTABLISHED", src)
 
-	// Track per-direction byte counts so the close log is informative.
+	// Track per-direction byte counts. We wait for BOTH goroutines so the
+	// log reflects reality — the earlier version waited for just one,
+	// which raced: if upstream EOF'd before any data flowed, we'd log
+	// 0B/0B even when the other direction had transferred bytes (or was
+	// still transferring).
+	//
+	// Closing the conns when one direction finishes unblocks the other
+	// from a stuck Read, so we don't hang forever in the wait.
 	var bytesUp, bytesDown int64
-	done := make(chan struct{}, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
+		defer wg.Done()
 		n, _ := io.Copy(up, shaped)
 		bytesUp = n
-		done <- struct{}{}
+		_ = up.Close() // unblock the other side's Read
 	}()
 	go func() {
+		defer wg.Done()
 		n, _ := io.Copy(shaped, up)
 		bytesDown = n
-		done <- struct{}{}
+		_ = conn.Close()
 	}()
-	<-done
+	wg.Wait()
 
 	logf("conn from %s: tunnel CLOSED after %s (up=%dB down=%dB)",
 		src, time.Since(startedAt).Round(time.Millisecond), bytesUp, bytesDown)

@@ -99,6 +99,108 @@ func TestHandshakeEndToEnd(t *testing.T) {
 	}
 }
 
+// TestHeartbeatInterleavedWithData regresses a bug where Fast-Path Read
+// recursed while holding readMu when an empty (heartbeat) PDU arrived,
+// deadlocking on the reentrant Lock(). Symptom in production: every
+// connection silently froze ~5s after the handshake and the browser
+// timed out ~11.6s later.
+func TestHeartbeatInterleavedWithData(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	cert := selfSignedCert(t)
+	serverTLS := &tls.Config{Certificates: []tls.Certificate{cert}}
+	clientTLS := &tls.Config{InsecureSkipVerify: true}
+
+	srvDone := make(chan error, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			srvDone <- err
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, err := Server(ctx, c, ServerConfig{
+			TLSConfig:     serverTLS,
+			Mode:          ModeStandalone,
+			CookieMatched: true,
+		})
+		if err != nil {
+			srvDone <- err
+			return
+		}
+		defer conn.Close()
+
+		// Emit a heartbeat between two real data writes. The client must
+		// transparently skip the heartbeat and read both data chunks.
+		stop := Heartbeater(conn, 50*time.Millisecond)
+		defer stop()
+
+		if _, err := conn.Write([]byte("first")); err != nil {
+			srvDone <- err
+			return
+		}
+		// Sleep > heartbeat interval so at least one fires between writes.
+		time.Sleep(150 * time.Millisecond)
+		if _, err := conn.Write([]byte("second")); err != nil {
+			srvDone <- err
+			return
+		}
+		// Read echo so client write completes before we tear down.
+		buf := make([]byte, 16)
+		_, _ = conn.Read(buf)
+		srvDone <- nil
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cc, err := Client(ctx, net.Dialer{Timeout: 3 * time.Second}, ClientConfig{
+		Address:   ln.Addr().String(),
+		Cookie:    "test",
+		Mode:      ModeStandalone,
+		TLSConfig: clientTLS,
+		Timeout:   5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	defer cc.Close()
+
+	got1 := make([]byte, 5)
+	_ = cc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(cc, got1); err != nil {
+		t.Fatalf("read1: %v (heartbeat deadlock regression?)", err)
+	}
+	if string(got1) != "first" {
+		t.Fatalf("got %q", got1)
+	}
+
+	got2 := make([]byte, 6)
+	_ = cc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(cc, got2); err != nil {
+		t.Fatalf("read2: %v (heartbeat between reads?)", err)
+	}
+	if string(got2) != "second" {
+		t.Fatalf("got %q", got2)
+	}
+
+	_, _ = cc.Write([]byte("ack"))
+
+	select {
+	case err := <-srvDone:
+		if err != nil {
+			t.Fatalf("server: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server didn't return")
+	}
+}
+
 // TestCookieGateRejectsBadCookie verifies the gate path is wired up:
 // a connection without the magic cookie should be flagged for splice.
 func TestCookieGateRejectsBadCookie(t *testing.T) {
