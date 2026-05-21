@@ -41,11 +41,8 @@
 
   "route": {
     "rules": [
-      { "protocol": "dns", "outbound": "dns-out" },
-      { "ip_is_private": true, "outbound": "block" },
-      { "ip_version": 6, "outbound": "block" }
+      { "protocol": "dns", "outbound": "dns-out" }
     ],
-    "final": "direct",
-    "auto_detect_interface": true
+    "final": "direct"
   }
 }
