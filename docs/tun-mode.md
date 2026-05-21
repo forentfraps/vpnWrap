@@ -1,170 +1,173 @@
-# sing-rdp-tun — system-wide TUN-mode VPN client
+# TUN-mode (system-wide) VPN
 
-`sing-rdp-tun` is the "real VPN" version of the client. It creates a TUN
-interface, sets your default route to it, and forwards every TCP
-connection through the RDP+VLESS tunnel. No per-app proxy config needed —
-every application running on your machine sees the tunnel transparently.
+The recommended way to route every app on your machine through the
+tunnel — no SOCKS5 proxy config per-app, no browser-specific setup.
 
-Compare to `sing-rdp-cli` (SOCKS5-only):
+## Architecture
 
-|                              | sing-rdp-cli | sing-rdp-tun |
-|------------------------------|--------------|--------------|
-| Setup complexity             | low          | medium       |
-| Browser only                 | yes          | no           |
-| All apps tunneled            | only if they support SOCKS5 | yes |
-| Requires admin / root        | no           | yes          |
-| Needs wintun.dll on Windows  | no           | yes          |
-| Supports UDP                 | n/a          | not yet (TCP only) |
+```
+[every app]
+     │ default route -> singrdp0 TUN
+     ▼
+[tun2socks.exe]            <- xjasonlyu/tun2socks (battle-tested external bin)
+     │ SOCKS5 to 127.0.0.1:1080
+     ▼
+[sing-rdp-cli.exe]         <- our existing all-in-one
+     │ VLESS + RDP wrap
+     ▼
+[your VPS:3389]
+```
 
-## Quick deploy
+Two binaries chained together. `tun2socks` handles the OS-level TUN
+device + routing; `sing-rdp-cli` handles the actual tunneling. A single
+`.bat` starts both.
+
+## Why two binaries and not one
+
+I tried building a single Go binary (`sing-rdp-tun`) using
+`github.com/sagernet/sing-tun`. That library has been in flux —
+namespace renames (sagernet ↔ metacubex), internal compile errors at
+specific tagged versions, breaking API shifts between minor releases.
+Pinning to a coherent version isn't reliable.
+
+`tun2socks` is much simpler scoped (one job: bridge TUN to SOCKS5), has
+been stable for years, and is widely used by Clash, Mihomo, Karing, and
+other VPN clients. Adopting it instead of writing our own is the
+pragmatic call.
+
+The Go source for `sing-rdp-tun` is still in the repo (`cmd/sing-rdp-tun/`)
+in case sing-tun stabilizes upstream. For now `./deploy.sh build-clients`
+doesn't build it.
+
+## Deploy
 
 ### On the VPS
 
 ```bash
 git pull
-./deploy.sh build-clients     # also fetches wintun.dll into ./dist/
-ls ./dist/sing-rdp-tun*
-ls ./dist/wintun.dll
-PUBLIC_HOST=$(curl -s ifconfig.me) ./deploy.sh client-config --json-tun > sing-rdp-tun.json
+./deploy.sh build-clients
+./deploy.sh fetch-tun2socks
+ls -la ./dist/
 ```
 
-You now have:
+You'll see:
 
-- `./dist/sing-rdp-tun.exe` (Windows) or platform variants
-- `./dist/sing-rdp-tun.bat` (Windows self-elevating launcher)
-- `./dist/wintun.dll` (Windows kernel driver shim)
-- `./sing-rdp-tun.json` (config with auto-route enabled)
+```
+sing-rdp-cli.exe                  # our SOCKS5 client
+tun2socks-windows-amd64.exe       # OS TUN <-> SOCKS5 bridge
+wintun.dll                        # Wintun driver shim (already there)
+sing-rdp-vpn.bat                  # self-elevating launcher
+sing-rdp-cli.bat                  # SOCKS5-only launcher (alternative)
+```
+
+Plus the macOS / Linux variants of `tun2socks-*`.
+
+Now make the connection config:
+
+```bash
+PUBLIC_HOST=$(curl -s ifconfig.me) ./deploy.sh client-config --json > sing-rdp.json
+```
+
+(Note: use `--json` not `--json-tun` — tun2socks doesn't need our
+TUN-specific config fields. Same simple `sing-rdp.json` works for both
+the SOCKS5-only and the full-VPN modes.)
 
 ### Copy to Windows
 
 ```powershell
-mkdir C:\sing-rdp-tun
-cd C:\sing-rdp-tun
-scp user@vps:/root/vpnWrap/dist/sing-rdp-tun.exe .
-scp user@vps:/root/vpnWrap/dist/sing-rdp-tun.bat .
+mkdir C:\sing-rdp
+cd C:\sing-rdp
+
+# scp each from the VPS:
+scp user@vps:/root/vpnWrap/dist/sing-rdp-cli.exe .
+scp user@vps:/root/vpnWrap/dist/tun2socks-windows-amd64.exe .
 scp user@vps:/root/vpnWrap/dist/wintun.dll .
-scp user@vps:/root/vpnWrap/sing-rdp-tun.json sing-rdp.json
+scp user@vps:/root/vpnWrap/dist/sing-rdp-vpn.bat .
+scp user@vps:/root/vpnWrap/sing-rdp.json .
 ```
 
-`sing-rdp.json` and `sing-rdp-tun.json` use the same schema — rename
-either one to whatever the .bat expects (`sing-rdp.json` by default).
+Five files in `C:\sing-rdp\`. Done.
 
 ### Run
 
-Double-click `sing-rdp-tun.bat`. You'll see a UAC prompt — accept. A
-console window opens showing:
+**Double-click `sing-rdp-vpn.bat`.** UAC prompt → accept. A console
+window opens showing:
 
 ```
-sing-rdp-tun 0.1.0
-tun:      singrdp0 172.19.0.1/30 mtu=1500
-upstream: <vps>:3389 (cookie=user-XXXX sni=DESKTOP-XXXXXXX)
-autoroute=true
-stack started; routing all TCP through tunnel
-apps should now reach the internet via <vps> — Ctrl+C to stop
+Starting sing-rdp-cli (SOCKS5 on 127.0.0.1:1080)...
+sing-rdp-cli 0.1.0
+SOCKS5 listening on 127.0.0.1:1080
+Starting tun2socks (TUN device + system route)...
+INFO[0000] [STACK] tun://wintun
+INFO[0000] [PROXY] socks5://127.0.0.1:1080
+INFO[0000] [TUN] gateway routed
 ```
 
-That's it. Every TCP connection from every app on the machine now goes
-through the tunnel.
+Every TCP connection from every app on your machine now goes through
+the VPS. No per-app proxy config.
 
 ### Verify
 
-In a new PowerShell window:
-
 ```powershell
-# Should print your VPS's public IP, not your home IP — directly,
-# without any --proxy flag:
+# Should print your VPS's IP, not your home IP — directly, without
+# any --socks5 flag:
 curl.exe https://api.ipify.org
-
-# Browser test: open https://whatismyipaddress.com — same IP shown
 ```
 
-## What you trade for system-wide routing
+### Stop
 
-### UDP doesn't work (yet)
+Close the console window or press **Ctrl+C** inside it. The TUN
+interface and routes are torn down automatically. `sing-rdp-cli.exe`
+is killed by the cleanup tail of the .bat.
 
-The VLESS protocol can carry UDP via the xudp extension but our implementation
-is TCP-only right now. Consequences:
+## Caveats
 
-- **DNS over UDP (the default)** — won't work through the tunnel. There
-  are three ways around this:
-  1. Configure your system DNS to a public DoH or DoT resolver
-     (1.1.1.1 / 8.8.8.8 over TCP). DNS-over-TCP works fine.
-  2. Put `1.1.1.1` in Windows network adapter settings → IPv4 → Properties → DNS,
-     then enable `DNS over HTTPS` (Windows 11) or use a DoH client.
-  3. Use a browser with built-in DoH (Firefox, Brave) — DNS lookups for
-     web traffic go through the browser's encrypted resolver and bypass the
-     UDP issue entirely.
-- **QUIC / HTTP/3 traffic** — most apps fall back to TCP automatically.
-  Chrome opts back to HTTP/2 over TCP when QUIC fails.
-- **Online games** — many use UDP. Don't expect them to work.
+### UDP
 
-I'll add UDP support in a future iteration; it's a bigger lift because it
-requires UDP-over-VLESS (xudp), which the inner sing-box VLESS would also
-need to be configured for.
+tun2socks supports UDP tunneling natively over SOCKS5. **But** sing-rdp-cli
+(our SOCKS5 server) only forwards TCP — UDP packets from tun2socks will
+be dropped. Consequences and workarounds same as before:
 
-### Bypass for the VPS itself
+- DNS over UDP won't work. Use DoH in your browser, or set system DNS
+  to a public DoT/DoH resolver.
+- QUIC / HTTP/3 won't work; browsers fall back to TCP-based HTTP/2.
+- Online games using UDP won't work.
 
-`auto_route: true` would normally route ALL traffic into the TUN —
-including the connection to the VPS, which would loop. sing-tun
-automatically excludes the VPS's IP from the TUN routes so the underlying
-RDP connection still uses your physical interface. You shouldn't need to
-think about this, but if your VPS IP ever changes you may need to
-restart the client.
+Adding UDP support is a future TODO — it needs xudp (UDP over VLESS) on
+both ends.
 
 ### Performance
 
-- One RDP+VLESS tunnel per TCP connection. That's expensive (each new
-  connection does X.224 → TLS → CredSSP → VLESS handshake, ~5–10 RTTs).
-  Browsing feels noticeably slower than a plain WireGuard VPN.
-- Future optimization: multiplex connections inside a single long-lived
-  RDP tunnel via VMess-style mux. Not yet implemented.
+Each new TCP connection spins up its own RDP+VLESS handshake (5–10
+round trips before first byte). Real WireGuard is way faster. Mux on
+the RDP layer is a future optimization.
+
+### Process lifetime
+
+If `sing-rdp-cli.exe` dies (crash, killed manually), `tun2socks.exe`
+keeps running but every SOCKS5 dial fails — apps see "connection refused"
+until you restart the .bat. Watchdog logic is on the TODO list.
+
+### What about Linux / macOS?
+
+The same model works — `tun2socks-linux-amd64` and `tun2socks-macos-*`
+binaries are built by `./deploy.sh fetch-tun2socks`. Equivalent
+launchers exist as shell scripts:
+
+```bash
+# On Linux/macOS, run as root or with sudo:
+./sing-rdp-cli-linux-amd64 -c sing-rdp.json &
+./tun2socks-linux-amd64 -device tun://singrdp0 -proxy socks5://127.0.0.1:1080
+```
+
+(Manual; I haven't shipped a packaged wrapper for Linux/macOS yet.)
 
 ## Troubleshooting
 
-### "wintun.dll missing"
-
-You forgot to copy `wintun.dll` next to the .exe. It must be in the same
-folder; Windows won't find it elsewhere by default.
-
-### "create tun: failed to create wintun adapter"
-
-You're not running as administrator. Use the `.bat` launcher which
-self-elevates, or right-click the .exe → Run as administrator.
-
-### "failed to set route" / no internet access after starting
-
-Likely your Windows network drivers are interfering. Check:
-
-1. The TUN interface exists: `ipconfig` should list a `singrdp0` interface
-   with IP `172.19.0.1`.
-2. Routes look right: `route print` should show `0.0.0.0/0` with gateway
-   pointing to the TUN's address.
-
-If not, the route install failed. Workaround: set `auto_route: false` in
-the config and add the route manually:
-
-```powershell
-netsh interface ipv4 set address name="singrdp0" static 172.19.0.1 255.255.255.252
-netsh interface ipv4 add route 0.0.0.0/0 "singrdp0" 172.19.0.1
-# Plus exclude the VPS so the underlying tunnel doesn't loop:
-netsh interface ipv4 add route <vps-ip>/32 "<your-normal-interface>" <your-normal-gw>
-```
-
-### Apps don't see the new route
-
-Some apps cache the network state. Close and re-open the app after
-starting sing-rdp-tun. Browsers especially.
-
-### Speed is bad
-
-Expected for now. See "Performance" above. The bottleneck is per-connection
-handshake overhead. Mux is the fix; it's on the roadmap.
-
-### How do I uninstall?
-
-Close sing-rdp-tun (Ctrl+C in the console, or close the window). The TUN
-interface and its routes disappear automatically. Delete the .exe / .dll
-/ .bat / .json files to clean up.
-
-Wintun's kernel driver self-uninstalls when no one is using it. Reboot
-to clear any leftover state if you really want it gone.
+| Symptom | Likely cause |
+|---|---|
+| UAC prompt loops | Windows policy blocks elevation — check Group Policy / antivirus |
+| "wintun.dll missing" | Copy `wintun.dll` next to the .exe |
+| tun2socks: "create interface failed" | Not running as admin; use the .bat |
+| Apps don't route through VPN | Old route table cached; reboot or `route delete 0.0.0.0` and restart |
+| sing-rdp-cli logs show connections, browser still loads from home IP | Browser cached the previous network state — close and reopen browser |

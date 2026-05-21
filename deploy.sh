@@ -20,6 +20,12 @@
 #   ./deploy.sh export-client  copy the linux/amd64 sing-rdp-client binary
 #                              out of the runtime image to ./dist/. For
 #                              other platforms, build from source.
+#   ./deploy.sh fetch-tun2socks
+#                              download tun2socks (xjasonlyu) prebuilt
+#                              binaries + write sing-rdp-vpn.bat. Pairs with
+#                              sing-rdp-cli.exe for a real TUN-mode VPN.
+#                              Pragmatic alternative to sing-rdp-tun while
+#                              that source stabilizes upstream.
 #   ./deploy.sh build-clients  cross-compile all client binaries to ./dist/:
 #                              - sing-rdp-cli.exe              (Windows)
 #                              - sing-rdp-cli-macos-{arm64,amd64}
@@ -380,53 +386,12 @@ cmd_build_clients() {
         )
     done
 
-    # sing-rdp-tun has its own go.mod (heavy gVisor + sing-tun deps that we
-    # don't want polluting the other binaries). Build it separately for
-    # the desktop platforms only — Android via Termux doesn't get a TUN
-    # interface easily.
-    echo "building sing-rdp-tun (TUN-mode VPN client)..."
-    local tun_targets=(
-        "windows-amd64|windows|amd64|sing-rdp-tun.exe"
-        "macos-arm64|darwin|arm64|sing-rdp-tun-macos-arm64"
-        "macos-amd64|darwin|amd64|sing-rdp-tun-macos-amd64"
-        "linux-amd64|linux|amd64|sing-rdp-tun-linux-amd64"
-    )
-    local out_abs
-    out_abs="$(pwd)/dist"
-    # If go.mod has been bumped (newer version pinned) but go.sum is from
-    # an earlier build with different versions, `go build` fails with
-    # cryptic errors. Detect a version bump by checking if go.sum
-    # references the current sing-tun version, and regenerate if not.
-    if [[ -f cmd/sing-rdp-tun/go.sum ]]; then
-        local pinned current
-        pinned=$(grep -oE 'sing-tun v[0-9]+\.[0-9]+\.[0-9]+' cmd/sing-rdp-tun/go.mod | head -1 | awk '{print $2}')
-        current=$(grep -oE 'sing-tun v[0-9]+\.[0-9]+\.[0-9]+' cmd/sing-rdp-tun/go.sum | head -1 | awk '{print $2}')
-        if [[ -n "$pinned" && -n "$current" && "$pinned" != "$current" ]]; then
-            echo "  sing-tun version bumped ($current -> $pinned); regenerating go.sum"
-            rm cmd/sing-rdp-tun/go.sum
-        fi
-    fi
-
-    for entry in "${tun_targets[@]}"; do
-        IFS='|' read -r name os arch out <<< "$entry"
-        echo "  ${name}: $out"
-        (
-            cd cmd/sing-rdp-tun
-            # Run go mod download/tidy once on first build so the deps are
-            # cached. Run it again if go.sum is missing (version bump).
-            if [[ ! -f go.sum ]]; then
-                go mod tidy 2>&1 || {
-                    echo "    go mod tidy failed for sing-rdp-tun — leaving TUN binary unbuilt"
-                    exit 0
-                }
-            fi
-            export GOOS="$os" GOARCH="$arch" CGO_ENABLED=0
-            go build -trimpath -ldflags="-s -w" -o "${out_abs}/${out}" . || {
-                echo "    sing-rdp-tun build failed for ${name} — continuing without TUN binary"
-                exit 0
-            }
-        )
-    done
+    # sing-rdp-tun (Go-native TUN binary) is parked: the sing-tun upstream
+    # has been thrashing namespaces (sagernet <-> metacubex) and can't be
+    # reliably pinned to a coherent version. The source stays in the repo
+    # for future revival; we use tun2socks as the practical bridge instead.
+    # See cmd_fetch_tun2socks below.
+    :
 
     # Drop a tiny launcher beside the Windows .exe so users can
     # double-click instead of opening PowerShell. It also pauses on
@@ -450,18 +415,75 @@ echo (process exited — press any key to close)
 pause >nul
 BATEOF
 
-    # sing-rdp-tun needs administrator privileges (TUN creation + routing).
-    # The .bat self-elevates via PowerShell if launched without admin.
-    cat > ./dist/sing-rdp-tun.bat <<'BATEOF'
+    # Note: the launcher for system-wide TUN-mode VPN (sing-rdp-vpn.bat)
+    # is written by `./deploy.sh fetch-tun2socks` because it depends on
+    # the tun2socks binary being fetched first.
+    echo
+    echo "built:"
+    ls -lh ./dist/sing-rdp-* 2>/dev/null | awk '{print "  "$NF" ("$5")"}'
+    echo "  ./dist/sing-rdp-cli.bat  (Windows launcher)"
+}
+
+cmd_fetch_tun2socks() {
+    require_tool curl curl
+    require_tool unzip unzip
+    mkdir -p ./dist
+
+    # xjasonlyu/tun2socks is the practical TUN<->SOCKS5 bridge. Stable
+    # binaries, MIT licensed, no Go-build hassles on our side. We pull
+    # the latest release for each platform we care about.
+    #
+    # Pin to a known-good tag so builds are reproducible; bump as needed
+    # when upstream tags a new release.
+    local tag="v2.5.2"
+    local base="https://github.com/xjasonlyu/tun2socks/releases/download/${tag}"
+
+    local targets=(
+        # platform-suffix in our dist/ | upstream-asset-name
+        "windows-amd64.exe|tun2socks-windows-amd64.zip"
+        "linux-amd64|tun2socks-linux-amd64.zip"
+        "macos-arm64|tun2socks-darwin-arm64.zip"
+        "macos-amd64|tun2socks-darwin-amd64.zip"
+    )
+
+    local entry suffix asset url tmp
+    for entry in "${targets[@]}"; do
+        IFS='|' read -r suffix asset <<< "$entry"
+        url="${base}/${asset}"
+        tmp=$(mktemp -d)
+        echo "fetching tun2socks ${tag} for ${suffix}..."
+        if ! curl -fsSL -o "$tmp/asset.zip" "$url"; then
+            echo "  download failed: $url" >&2
+            rm -rf "$tmp"
+            continue
+        fi
+        # Extract; the .zip contains a single binary named like
+        # tun2socks-<os>-<arch>[.exe].
+        unzip -q -j "$tmp/asset.zip" -d "$tmp"
+        local extracted
+        extracted=$(find "$tmp" -maxdepth 1 -name 'tun2socks-*' -not -name '*.zip' | head -1)
+        if [[ -z "$extracted" ]]; then
+            echo "  could not find binary in archive" >&2
+            rm -rf "$tmp"
+            continue
+        fi
+        mv "$extracted" "./dist/tun2socks-${suffix}"
+        chmod +x "./dist/tun2socks-${suffix}"
+        rm -rf "$tmp"
+    done
+
+    # Write the Windows launcher that chains sing-rdp-cli + tun2socks.
+    # Self-elevates because TUN/Wintun + routing require admin.
+    cat > ./dist/sing-rdp-vpn.bat <<'BATEOF'
 @echo off
-REM Launcher for sing-rdp-tun.exe (TUN-mode VPN client).
-REM Self-elevates to administrator if not already. Requires wintun.dll
-REM in the same folder.
+REM Full TUN-mode VPN launcher. Starts sing-rdp-cli (SOCKS5 listener) and
+REM tun2socks (TUN<->SOCKS5 bridge) together. Closing the window stops
+REM the VPN.
 
 setlocal
 cd /d "%~dp0"
 
-REM Check for admin: 'net session' fails without elevation.
+REM Self-elevate to administrator (TUN + routing both require it).
 net session >nul 2>&1
 if %errorlevel% neq 0 (
     echo Requesting administrator rights...
@@ -469,27 +491,39 @@ if %errorlevel% neq 0 (
     exit /b
 )
 
-if not exist wintun.dll (
-    echo wintun.dll missing from %CD%
-    echo Download from https://www.wintun.net/ and place beside the .exe
-    pause
-    exit /b 1
-)
-if not exist sing-rdp.json (
-    echo sing-rdp.json not found in %CD%
-    pause
-    exit /b 1
+REM Sanity checks.
+for %%F in (sing-rdp-cli.exe tun2socks-windows-amd64.exe wintun.dll sing-rdp.json) do (
+    if not exist %%F (
+        echo missing %%F  -- copy it next to this script
+        pause
+        exit /b 1
+    )
 )
 
-sing-rdp-tun.exe -c sing-rdp.json
-echo.
-echo (process exited — press any key to close)
-pause >nul
+REM Start the SOCKS5 listener in the background.
+echo Starting sing-rdp-cli (SOCKS5 on 127.0.0.1:1080)...
+start /b "" sing-rdp-cli.exe -c sing-rdp.json
+
+REM Give it ~2s to bind the socket before tun2socks dials it.
+timeout /t 2 /nobreak >nul
+
+REM Start tun2socks. -device wintun creates the TUN interface, -proxy
+REM is the SOCKS5 endpoint sing-rdp-cli is listening on.
+echo Starting tun2socks (TUN device + system route)...
+tun2socks-windows-amd64.exe -device wintun -proxy socks5://127.0.0.1:1080 -loglevel info
+
+REM tun2socks runs in the foreground; when it exits (Ctrl+C / close),
+REM tear down sing-rdp-cli too.
+echo Stopping sing-rdp-cli...
+taskkill /im sing-rdp-cli.exe /f >nul 2>&1
 BATEOF
+
     echo
-    echo "built:"
-    ls -lh ./dist/sing-rdp-* 2>/dev/null | awk '{print "  "$NF" ("$5")"}'
-    echo "  ./dist/sing-rdp-cli.bat  (Windows launcher)"
+    echo "fetched:"
+    ls -lh ./dist/tun2socks-* ./dist/sing-rdp-vpn.bat 2>/dev/null | awk '{print "  "$NF" ("$5")"}'
+    echo
+    echo "Combined with the existing sing-rdp-cli.exe + wintun.dll + sing-rdp.json,"
+    echo "users now have a one-click TUN VPN. See docs/tun-mode.md for setup."
 }
 
 cmd_export_client() {
@@ -662,6 +696,7 @@ case "$cmd" in
     export-client)  cmd_export_client "$@" ;;
     build-mobile)   cmd_build_clients "$@" ;;  # legacy alias
     build-clients)  cmd_build_clients "$@" ;;
+    fetch-tun2socks) cmd_fetch_tun2socks "$@" ;;
     doctor)         cmd_doctor "$@" ;;
     rotate)         cmd_rotate "$@" ;;
     ""|help|-h|--help) usage ;;
