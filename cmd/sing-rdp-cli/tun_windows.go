@@ -96,10 +96,16 @@ func runTUN(ctx context.Context, cfg *Config) error {
 	})
 
 	// --- 2. Spawn tun2socks -------------------------------------------
+	// tun2socks uses logrus; valid levels are trace/debug/info/warning/
+	// error/fatal/panic. The intuitive "warn" is REJECTED with a fatal
+	// at startup ("not a valid logrus Level"), so always use "warning"
+	// or "info". We go with "info" because tun2socks's per-packet
+	// chatter is gated behind debug and the info lines are useful
+	// startup confirmation.
 	tun2socksCmd := exec.CommandContext(ctx, tun2socksPath,
 		"-device", tunAlias,
 		"-proxy", fmt.Sprintf("socks5://%s", cfg.LocalSOCKS),
-		"-loglevel", "warn",
+		"-loglevel", "info",
 	)
 	tun2socksCmd.Stdout = os.Stdout
 	tun2socksCmd.Stderr = os.Stderr
@@ -109,7 +115,7 @@ func runTUN(ctx context.Context, cfg *Config) error {
 	}
 	tun2socksExited := make(chan struct{})
 	go func() {
-		tun2socksCmd.Wait()
+		_ = tun2socksCmd.Wait()
 		close(tun2socksExited)
 	}()
 	cleanup.Add(func() error {
@@ -120,8 +126,12 @@ func runTUN(ctx context.Context, cfg *Config) error {
 	})
 
 	// --- 3. Wait for Wintun adapter to appear -------------------------
-	if err := waitForAdapter(tunAlias, 10*time.Second); err != nil {
-		return fmt.Errorf("Wintun adapter never appeared: %w", err)
+	// Race-aware wait: if tun2socks itself dies before the adapter
+	// shows up, surface that immediately rather than blocking on the
+	// timeout. The earlier version waited the full 10s even when the
+	// real failure (logrus level rejection) had been visible since t+0.
+	if err := waitForAdapterOrExit(tunAlias, tun2socksExited, 10*time.Second); err != nil {
+		return err
 	}
 
 	// --- 4. Configure Wintun (IP + default route) ---------------------
@@ -259,23 +269,45 @@ func runQuiet(name string, args ...string) error {
 	return nil
 }
 
-// waitForAdapter polls for a network interface by name. Wintun takes ~2s
-// to come up after tun2socks creates it; this avoids racing the netsh
-// configuration call.
-func waitForAdapter(name string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		ifaces, err := net.Interfaces()
-		if err == nil {
-			for _, ifa := range ifaces {
-				if strings.EqualFold(ifa.Name, name) {
-					return nil
-				}
-			}
+// waitForAdapterOrExit polls for a network interface by name AND watches
+// for tun2socks dying. Returns nil when the adapter appears, or an error
+// describing why we gave up (timeout OR tun2socks exited early).
+//
+// The early-exit path matters because tun2socks's startup errors —
+// invalid loglevel, missing wintun.dll, port conflicts — surface on its
+// stderr the instant it's killed by `log.Fatal`. Without this check, the
+// orchestrator just waits the full timeout and reports "adapter never
+// appeared" while the actual cause scrolled past 10 seconds ago.
+func waitForAdapterOrExit(name string, exited <-chan struct{}, timeout time.Duration) error {
+	deadline := time.After(timeout)
+	tick := time.NewTicker(200 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if adapterExists(name) {
+			return nil
 		}
-		time.Sleep(200 * time.Millisecond)
+		select {
+		case <-exited:
+			return fmt.Errorf("tun2socks exited before adapter %q came up (check the fatal/error line above)", name)
+		case <-deadline:
+			return fmt.Errorf("adapter %q not found within %s", name, timeout)
+		case <-tick.C:
+			// loop and re-poll
+		}
 	}
-	return fmt.Errorf("adapter %q not found within %s", name, timeout)
+}
+
+func adapterExists(name string) bool {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return false
+	}
+	for _, ifa := range ifaces {
+		if strings.EqualFold(ifa.Name, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // prefixToNetmask converts a CIDR prefix length into the dotted-quad
