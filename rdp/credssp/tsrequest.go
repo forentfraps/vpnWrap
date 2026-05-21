@@ -26,14 +26,20 @@ const TSRequestVersion = 6
 //
 // Note: encoding/asn1's `optional` tag works correctly for slice fields
 // (nil = omitted), and `explicit,tag:N` produces the [N] EXPLICIT wrapper
-// CredSSP expects. For ErrorCode we use a pointer so the zero value (0)
-// can still be encoded when explicitly set.
+// CredSSP expects.
+//
+// ErrorCode is int64, not int — NTSTATUS values like STATUS_LOGON_FAILURE
+// (0xC000006D = 3,221,225,581) exceed 2^31-1 and overflow `int` when
+// compiled for 32-bit platforms (linux/arm, linux/386). int64 also matches
+// the unsigned-32-bit semantics Windows uses on the wire: encoding/asn1
+// emits the value with a leading 00 byte for the positive form, which is
+// what mstsc/CredSSP expects.
 type TSRequest struct {
 	Version     int        `asn1:"explicit,tag:0"`
 	NegoTokens  []NegoItem `asn1:"explicit,optional,tag:1"`
 	AuthInfo    []byte     `asn1:"explicit,optional,tag:2"`
 	PubKeyAuth  []byte     `asn1:"explicit,optional,tag:3"`
-	ErrorCode   int        `asn1:"explicit,optional,tag:4"`
+	ErrorCode   int64      `asn1:"explicit,optional,tag:4"`
 	ClientNonce []byte     `asn1:"explicit,optional,tag:5"`
 }
 

@@ -12,6 +12,18 @@ build:
 test:
 	go test -count=1 -race ./rdp/... ./health/... ./shape/...
 
+# Cross-compile against every target deploy.sh build-clients ships, so 32-bit
+# constant-overflow bugs and similar platform-specific issues fail loudly in
+# CI instead of waiting until the user runs build-clients.
+test-cross:
+	@for t in linux/amd64 linux/arm64 linux/arm/7 darwin/amd64 darwin/arm64 windows/amd64; do \
+		os=$$(echo $$t | cut -d/ -f1); arch=$$(echo $$t | cut -d/ -f2); arm=$$(echo $$t | cut -d/ -f3); \
+		echo "==> $$os/$$arch$${arm:+/v$$arm}"; \
+		GOOS=$$os GOARCH=$$arch GOARM=$$arm CGO_ENABLED=0 \
+			go build -o /dev/null ./cmd/sing-rdp-client ./cmd/sing-rdp-cli ./rdp/... ./health/... ./shape/... || exit 1; \
+	done
+	@echo "all platforms build cleanly"
+
 # Build the runtime image.
 docker:
 	docker build -t sing-rdp:latest --target runtime .
