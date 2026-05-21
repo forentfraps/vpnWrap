@@ -36,9 +36,13 @@ import (
 	"github.com/vpnwrap/sing-rdp/rdp/credssp"
 )
 
+// runTUN is defined per-platform in tun_windows.go and tun_other.go.
+// It blocks until ctx is cancelled or the spawned tun2socks exits.
+
 var (
 	flagConfig  = flag.String("c", "sing-rdp.json", "path to JSON config file")
 	flagVerbose = flag.Bool("v", false, "verbose logging")
+	flagTUN     = flag.Bool("tun", false, "enable system-wide TUN mode (Windows: needs admin + tun2socks.exe + wintun.dll alongside)")
 )
 
 const version = "0.1.0"
@@ -106,6 +110,11 @@ func main() {
 	log.Printf("upstream:                 %s (cookie=%s sni=%s)", cfg.Server, cfg.Cookie, cfg.SNI)
 	log.Printf("point apps at:            socks5://%s", cfg.LocalSOCKS)
 
+	// Single cancellable context drives shutdown of everything that
+	// might be running — the SOCKS5 listener, the TUN orchestration,
+	// the spawned tun2socks subprocess.
+	ctx, cancel := context.WithCancel(context.Background())
+
 	// Clean shutdown on Ctrl+C / Windows close. On Windows os.Interrupt
 	// fires for both Ctrl+C and Ctrl+Break.
 	go func() {
@@ -113,8 +122,23 @@ func main() {
 		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 		<-sig
 		log.Printf("shutting down")
+		cancel()
 		ln.Close()
 	}()
+
+	// If TUN mode requested, run the orchestration in a goroutine. It
+	// returns when ctx is cancelled (signal) or tun2socks dies; either
+	// way we close the SOCKS5 listener after it to bring the process
+	// down fully.
+	if *flagTUN {
+		go func() {
+			if err := runTUN(ctx, cfg); err != nil {
+				log.Printf("[tun] %v", err)
+			}
+			cancel()
+			ln.Close()
+		}()
+	}
 
 	if err := ServeSOCKS5(ln, dialer, udpRelay, logf); err != nil {
 		// Listener Close() returns an error here; ignore quietly.
