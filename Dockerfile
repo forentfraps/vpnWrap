@@ -68,6 +68,9 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 COPY --from=builder /out/sing-rdp-server /usr/local/bin/sing-rdp-server
 COPY --from=builder /out/sing-rdp-probe  /usr/local/bin/sing-rdp-probe
+# sing-rdp-client is bundled so users on linux/amd64 can extract it via
+# `./deploy.sh export-client` without needing a Go toolchain locally.
+COPY --from=builder /out/sing-rdp-client /usr/local/bin/sing-rdp-client
 
 # Volumes for certs (mount real cert here in production).
 RUN mkdir -p /etc/sing-rdp

@@ -15,7 +15,21 @@
 #                              server (validates the handshake works
 #                              end-to-end via a real CredSSP exchange).
 #   ./deploy.sh client-config  print the client-side flags needed to
-#                              connect to this server.
+#                              connect to this server. Auto-detects the
+#                              VPS's public IP (override with PUBLIC_HOST).
+#   ./deploy.sh export-client  copy the linux/amd64 sing-rdp-client binary
+#                              out of the runtime image to ./dist/. For
+#                              other platforms, build from source.
+#   ./deploy.sh build-clients  cross-compile all client binaries to ./dist/:
+#                              - sing-rdp-cli.exe              (Windows)
+#                              - sing-rdp-cli-macos-{arm64,amd64}
+#                              - sing-rdp-cli-linux-amd64
+#                              - sing-rdp-client-android-{arm64,armv7}
+#                              The .exe / macOS / Linux variants are
+#                              all-in-one (SOCKS5+VLESS+RDP, no companion
+#                              sing-box needed). Android uses Termux +
+#                              NekoBox per docs/mobile-android.md.
+#   ./deploy.sh build-mobile   alias for build-clients (legacy).
 #   ./deploy.sh rotate         generate a new identity + restart. The old
 #                              cookie is invalidated; clients need the new
 #                              cookie to reconnect.
@@ -91,6 +105,27 @@ need_env() {
     set -a; source "$ENV_FILE"; set +a
 }
 
+# detect_public_ip tries a few well-known IP-echo services. Returns the
+# first valid IPv4 it gets, or empty if none responded. We try multiple
+# providers because any one of them can be blocked or rate-limited from
+# the VPS; the fallback chain keeps this working in awkward networks.
+detect_public_ip() {
+    local ip url
+    for url in \
+        "https://api.ipify.org" \
+        "https://ifconfig.me" \
+        "https://icanhazip.com" \
+        "https://checkip.amazonaws.com"
+    do
+        ip=$(curl -fsS -4 --max-time 3 "$url" 2>/dev/null | tr -d '[:space:]')
+        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ---------- commands ----------
 
 cmd_init() {
@@ -157,16 +192,76 @@ cmd_probe() {
 
 cmd_client_config() {
     need_env
-    : "${PUBLIC_HOST:?set PUBLIC_HOST to the IP/hostname clients will connect to}"
     : "${VLESS_UUID:?VLESS_UUID missing from .env; rerun ./deploy.sh init or rotate}"
 
-    cat <<EOF
-##
-## Client-side setup (two processes: sing-rdp-client wraps RDP; sing-box
-## speaks VLESS through the wrapper).
-##
+    # Auto-detect the VPS's public IP when the user didn't override it.
+    # Manual override is still respected (e.g. when using a domain name).
+    if [[ -z "${PUBLIC_HOST:-}" ]]; then
+        need_http
+        echo "PUBLIC_HOST not set, auto-detecting via IP-echo services..." >&2
+        if PUBLIC_HOST=$(detect_public_ip); then
+            echo "detected: PUBLIC_HOST=${PUBLIC_HOST}" >&2
+            echo "(override by setting PUBLIC_HOST=... explicitly if wrong)" >&2
+            echo >&2
+        else
+            die "could not auto-detect public IP; set PUBLIC_HOST=<vps-ip-or-domain> explicitly"
+        fi
+    fi
 
-# --- 1. start the RDP wrapper locally (any platform with a Go binary) ---
+    # --json emits ONLY the sing-rdp-cli config blob, suitable for piping
+    # straight to a file on the client:
+    #   ssh vps "./deploy.sh client-config --json" > sing-rdp.json
+    if [[ "${1:-}" == "--json" ]]; then
+        cat <<EOF
+{
+  "server":      "${PUBLIC_HOST}:3389",
+  "cookie":      "${SING_RDP_COOKIE}",
+  "sni":         "${SING_RDP_SNI}",
+  "vless_uuid":  "${VLESS_UUID}",
+  "local_socks": "127.0.0.1:1080",
+  "hostname":    "DESKTOP-CLIENT0",
+  "insecure":    true
+}
+EOF
+        return 0
+    fi
+
+    cat <<EOF
+###############################################################################
+# QUICKEST PATH — single-binary Windows/macOS/Linux client (sing-rdp-cli)
+###############################################################################
+#
+# 1. On the VPS, build the clients once:
+#      ./deploy.sh build-clients
+#    Then copy the right binary to your client device:
+#      ./dist/sing-rdp-cli.exe              (Windows)
+#      ./dist/sing-rdp-cli-macos-arm64      (Apple Silicon)
+#      ./dist/sing-rdp-cli-macos-amd64      (Intel Mac)
+#      ./dist/sing-rdp-cli-linux-amd64      (desktop Linux)
+#
+# 2. Copy this config to a file next to the binary, save as sing-rdp.json:
+
+$(cmd_client_config --json)
+
+# 3. Run the binary:
+#      Windows:   sing-rdp-cli.exe -c sing-rdp.json
+#      macOS/Lx:  ./sing-rdp-cli-... -c sing-rdp.json
+#
+# 4. Point your browser at SOCKS5 127.0.0.1:1080
+#      Firefox: Settings -> Network -> Manual -> SOCKS v5 host=127.0.0.1 port=1080
+#      Chrome:  --proxy-server=socks5://127.0.0.1:1080
+#
+# Done. One process, one port to remember.
+
+
+###############################################################################
+# ALTERNATE PATH — split mode (sing-rdp-client + your own sing-box)
+###############################################################################
+#
+# Useful if you already run sing-box and want to chain through. The wrapper
+# only does the RDP layer; you bring your own VLESS terminator.
+
+# --- 1. start the RDP wrapper locally ---
 sing-rdp-client \\
     --local 127.0.0.1:1081 \\
     --remote ${PUBLIC_HOST}:3389 \\
@@ -218,6 +313,66 @@ sing-rdp-client \\
 EOF
 }
 
+cmd_build_clients() {
+    require_tool go golang-go
+    mkdir -p ./dist
+
+    # Each entry: name|GOOS|GOARCH|extra-env|output|cmd-path
+    local targets=(
+        # All-in-one Windows CLI (SOCKS5 + VLESS + RDP in one .exe).
+        "windows-amd64|windows|amd64||sing-rdp-cli.exe|./cmd/sing-rdp-cli"
+        # All-in-one macOS CLI (Apple Silicon + Intel).
+        "macos-arm64|darwin|arm64||sing-rdp-cli-macos-arm64|./cmd/sing-rdp-cli"
+        "macos-amd64|darwin|amd64||sing-rdp-cli-macos-amd64|./cmd/sing-rdp-cli"
+        # All-in-one Linux desktop.
+        "linux-amd64|linux|amd64||sing-rdp-cli-linux-amd64|./cmd/sing-rdp-cli"
+        # Termux-on-Android (uses sing-rdp-client; pair with NekoBox).
+        "android-arm64|linux|arm64||sing-rdp-client-android-arm64|./cmd/sing-rdp-client"
+        "android-armv7|linux|arm|GOARM=7|sing-rdp-client-android-armv7|./cmd/sing-rdp-client"
+    )
+
+    local entry name os arch extra out cmd
+    for entry in "${targets[@]}"; do
+        IFS='|' read -r name os arch extra out cmd <<< "$entry"
+        echo "building ${name}: $out"
+        (
+            export GOOS="$os" GOARCH="$arch" CGO_ENABLED=0
+            [[ -n "$extra" ]] && eval "export $extra"
+            go build -trimpath -ldflags="-s -w" -o "./dist/${out}" "$cmd"
+        )
+    done
+
+    echo
+    echo "built:"
+    ls -lh ./dist/sing-rdp-* 2>/dev/null | awk '{print "  "$NF" ("$5")"}'
+}
+
+cmd_export_client() {
+    need_docker
+    if ! docker image inspect sing-rdp:latest >/dev/null 2>&1; then
+        die "sing-rdp:latest image not built yet — run './deploy.sh up' first"
+    fi
+    mkdir -p ./dist
+    # The runtime image is linux/amd64. Pull the binary out with a
+    # short-lived container; works regardless of whether sing-rdp is
+    # currently running.
+    docker run --rm \
+        -v "$(pwd)/dist:/host" \
+        --entrypoint /bin/sh \
+        sing-rdp:latest \
+        -c 'cp /usr/local/bin/sing-rdp-client /host/sing-rdp-client && chmod +x /host/sing-rdp-client'
+    echo
+    echo "extracted: ./dist/sing-rdp-client   (linux/amd64)"
+    echo
+    echo "for other platforms, build from source on the client machine:"
+    echo "  git clone <this repo>"
+    echo "  cd vpnWrap && go build -o sing-rdp-client ./cmd/sing-rdp-client"
+    echo
+    echo "or cross-compile from this VPS for your target:"
+    echo "  GOOS=darwin GOARCH=arm64 go build -o sing-rdp-client-mac ./cmd/sing-rdp-client"
+    echo "  GOOS=windows GOARCH=amd64 go build -o sing-rdp-client.exe ./cmd/sing-rdp-client"
+}
+
 cmd_rotate() {
     need_docker
     need_identity_tools
@@ -251,6 +406,9 @@ case "$cmd" in
     logs)           cmd_logs "$@" ;;
     probe)          cmd_probe "$@" ;;
     client-config)  cmd_client_config "$@" ;;
+    export-client)  cmd_export_client "$@" ;;
+    build-mobile)   cmd_build_clients "$@" ;;  # legacy alias
+    build-clients)  cmd_build_clients "$@" ;;
     rotate)         cmd_rotate "$@" ;;
     ""|help|-h|--help) usage ;;
     *) die "unknown command: $cmd (try './deploy.sh help')" ;;
