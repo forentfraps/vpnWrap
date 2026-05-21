@@ -28,13 +28,22 @@ FROM debian:bookworm-slim AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 
 # xrdp + a minimal X stack + openssl for cert generation.
-# `xorgxrdp` is the X11 backend xrdp uses for live sessions.
-# `openbox` + `xterm` give us a renderable desktop so a probing client
-# sees actual screen updates rather than a blank session.
+#
+# Package notes:
+#   - xorgxrdp:   X11 backend xrdp uses for live sessions
+#   - openbox:    minimal window manager
+#   - xterm:      terminal emulator for the cover desktop
+#   - x11-apps:   provides xclock (used as cover-traffic generator).
+#                 NOTE: there is no standalone "xclock" package on Debian
+#                 bookworm — it lives inside x11-apps. Earlier versions
+#                 of this Dockerfile listed `xclock` directly and apt
+#                 exited 100. Don't revert.
+#   - dbus-x11:   xrdp's session bus
+#   - tini:       PID 1 signal handler
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         xrdp xorgxrdp \
-        openbox xterm xclock \
+        openbox xterm x11-apps \
         dbus-x11 \
         ca-certificates openssl tini \
         wget \
