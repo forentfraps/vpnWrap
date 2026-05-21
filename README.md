@@ -20,27 +20,3 @@ is the recommended deployment for production — see [docs/embed.md](docs/embed.
                        opens "VPNW" SVC, frames data as           feeds bytes back to inbound
                        Fast-Path Output PDUs                      sing-box pipeline
 ```
-
-## Threat model
-
-Target: TSPU-class DPI that fingerprints by protocol structure and active-probes
-suspicious flows. Not designed to resist a state actor with endpoint compromise.
-
-Specifically defends against:
-- Port + protocol structure mismatch (we are byte-correct RDP through NLA)
-- TLS ClientHello fingerprinting (we use utls to clone mstsc.exe's hello)
-- Active probing (server presents a working RDP login screen; tunnel only opens on
-  authenticated session with the right channel name)
-
-Does **not** defend against:
-- Volumetric anomaly (a single "RDP user" pushing 100 GB/day looks wrong — apply caps)
-- Destination-IP heuristics (use business-grade hosting, not a fresh OVH box)
-- Endpoint compromise / TLS interception on the device
-
-## Layout
-
-- `rdp/` — RDP protocol bits we need (X.224, RDPNEG, MCS framing, Fast-Path)
-- `transport/` — sing-box `V2RayClientTransport` / `V2RayServerTransport` impls
-- `shape/` — traffic shaper (server-dominant ratio + idle heartbeats)
-- `cmd/sing-rdp-probe` — standalone tool for poking at an RDP endpoint to validate
-  the handshake matches a real one
